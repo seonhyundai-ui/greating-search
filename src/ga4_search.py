@@ -91,18 +91,21 @@ def _client() -> BetaAnalyticsDataClient:
 
 
 def fetch_search_terms(
-    target_date: str,
+    start_date: str,
+    end_date: str | None = None,
     limit: int = MAX_ROWS,
 ) -> list[dict]:
-    """Fetch safe search terms for one date, ordered by search views."""
+    """Fetch safe search terms for one day or a date range."""
+    end_date = end_date or start_date
+
     request = RunReportRequest(
         property=f"properties/{GA4_PROPERTY_ID}",
         dimensions=[Dimension(name=SEARCH_DIMENSION)],
         metrics=[Metric(name=SEARCH_METRIC)],
         date_ranges=[
             DateRange(
-                start_date=target_date,
-                end_date=target_date,
+                start_date=start_date,
+                end_date=end_date,
             )
         ],
         dimension_filter=build_search_filter(),
@@ -140,29 +143,74 @@ def fetch_search_terms(
     return rows
 
 
+def comparison_ranges(
+    target_start: date,
+    target_end: date,
+    compare_mode: str,
+    custom_start: date | None = None,
+    custom_end: date | None = None,
+) -> list[tuple[date, date]]:
+    """Build comparison periods while preserving target-period length."""
+    if target_start > target_end:
+        raise ValueError("분석 시작일은 종료일보다 늦을 수 없습니다.")
+
+    if compare_mode == "전일":
+        return [
+            (
+                target_start - timedelta(days=1),
+                target_end - timedelta(days=1),
+            )
+        ]
+
+    if compare_mode == "직전기간":
+        period_days = (target_end - target_start).days + 1
+        compare_end = target_start - timedelta(days=1)
+        compare_start = compare_end - timedelta(days=period_days - 1)
+        return [(compare_start, compare_end)]
+
+    if compare_mode == "전주":
+        return [
+            (
+                target_start - timedelta(days=7),
+                target_end - timedelta(days=7),
+            )
+        ]
+
+    if compare_mode == "4주평균":
+        return [
+            (
+                target_start - timedelta(days=7 * week),
+                target_end - timedelta(days=7 * week),
+            )
+            for week in range(1, 5)
+        ]
+
+    if compare_mode == "Custom Date":
+        if custom_start is None or custom_end is None:
+            raise ValueError("Custom Date 시작일과 종료일을 선택해주세요.")
+
+        if custom_start > custom_end:
+            raise ValueError("Custom Date 시작일은 종료일보다 늦을 수 없습니다.")
+
+        return [(custom_start, custom_end)]
+
+    raise ValueError(f"지원하지 않는 비교 기준입니다: {compare_mode}")
+
+
 def comparison_dates(
     target_date: date,
     compare_mode: str,
     custom_date: date | None = None,
 ) -> list[date]:
-    if compare_mode == "전일":
-        return [target_date - timedelta(days=1)]
-
-    if compare_mode == "전주":
-        return [target_date - timedelta(days=7)]
-
-    if compare_mode == "4주평균":
-        return [
-            target_date - timedelta(days=7 * week)
-            for week in range(1, 5)
-        ]
-
-    if compare_mode == "Custom Date":
-        if custom_date is None:
-            raise ValueError("Custom Date를 선택해주세요.")
-        return [custom_date]
-
-    raise ValueError(f"지원하지 않는 비교 기준입니다: {compare_mode}")
+    """Backward-compatible one-day comparison helper."""
+    ranges = comparison_ranges(
+        target_start=target_date,
+        target_end=target_date,
+        compare_mode=compare_mode,
+        custom_start=custom_date,
+        custom_end=custom_date,
+    )
+    return [start for start, _ in ranges]
 
 
 def aggregate_average(

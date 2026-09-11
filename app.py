@@ -9,13 +9,14 @@ import streamlit as st
 
 from src.ga4_search import (
     aggregate_average,
-    comparison_dates,
+    comparison_ranges,
     fetch_search_terms,
 )
 
 
-APP_VERSION = "0.1.3"
+APP_VERSION = "0.2.0"
 APP_TITLE = "DAILY SEARCH | 고객이 새롭게 찾고 있는 건 뭘까? 🔎"
+DATA_START_DATE = date(2026, 9, 3)
 
 
 st.set_page_config(
@@ -51,12 +52,14 @@ st.markdown(
     .main-caption {
         color: #8a94a5;
         font-size: 0.83rem;
-        margin-bottom: 1rem;
+        margin-bottom: 0.3rem;
     }
 
-    .control-card-note {
+    .data-note {
         color: #667085;
         font-size: 0.78rem;
+        font-weight: 650;
+        margin-bottom: 0.9rem;
     }
 
     div[data-testid="stVerticalBlockBorderWrapper"] {
@@ -120,7 +123,6 @@ st.markdown(
         border-radius: 7px;
     }
 
-
     .control-label {
         color: #475467;
         font-size: 0.78rem;
@@ -131,15 +133,12 @@ st.markdown(
     }
 
     .button-label {
-        visibility: hidden;
+        color: transparent;
+        user-select: none;
     }
 
     .search-panel-offset {
         height: 4.15rem;
-    }
-
-    .plot-caption-space {
-        height: 0.1rem;
     }
 
     div[data-testid="stDataFrame"] {
@@ -205,8 +204,14 @@ def check_password() -> bool:
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def load_date_rows(target_date: str) -> list[dict]:
-    return fetch_search_terms(target_date)
+def load_range_rows(
+    start_date: str,
+    end_date: str,
+) -> list[dict]:
+    return fetch_search_terms(
+        start_date=start_date,
+        end_date=end_date,
+    )
 
 
 def _safe_total(rows: list[dict]) -> float:
@@ -220,10 +225,35 @@ def _format_count(value: float) -> str:
 def _compare_label(mode: str) -> str:
     return {
         "전일": "전일",
+        "직전기간": "직전기간",
         "전주": "전주",
         "4주평균": "4주평균",
         "Custom Date": "Custom Date",
     }[mode]
+
+
+def _normalize_range(value) -> tuple[date, date]:
+    if isinstance(value, date):
+        return value, value
+
+    if isinstance(value, (tuple, list)):
+        if len(value) == 0:
+            raise ValueError("날짜를 선택해주세요.")
+        if len(value) == 1:
+            return value[0], value[0]
+        return value[0], value[1]
+
+    raise ValueError("날짜 범위를 해석할 수 없습니다.")
+
+
+def _period_days(start: date, end: date) -> int:
+    return (end - start).days + 1
+
+
+def _period_text(start: date, end: date) -> str:
+    if start == end:
+        return start.isoformat()
+    return f"{start.isoformat()} ~ {end.isoformat()}"
 
 
 def _build_compare_dataframe(
@@ -241,7 +271,6 @@ def _build_compare_dataframe(
     }
 
     current_total = sum(current_map.values())
-
     records = []
 
     for term, current_views in current_map.items():
@@ -316,7 +345,11 @@ with header_left:
         unsafe_allow_html=True,
     )
     st.markdown(
-        '<div class="main-caption">GA4 검색 데이터를 직접 조회해 분석일과 선택 기준일의 검색 흐름을 비교합니다.</div>',
+        '<div class="main-caption">GA4 검색 데이터를 직접 조회해 분석 기간과 선택 기준 기간의 검색 흐름을 비교합니다.</div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        '<div class="data-note">※ 2026년 9월 3일부터 데이터 적재</div>',
         unsafe_allow_html=True,
     )
 
@@ -330,36 +363,77 @@ with header_right:
         st.rerun()
 
 
+default_analysis = max(
+    DATA_START_DATE,
+    date.today() - timedelta(days=1),
+)
+
 with st.container(border=True):
-    c1, c2, c3, c4 = st.columns([1.25, 2.2, 1.35, 1.0])
+    c1, c2, c3, c4 = st.columns([1.45, 2.15, 1.45, 1.0])
 
     with c1:
-        analysis_date = st.date_input(
-            "분석일",
-            value=date.today() - timedelta(days=1),
+        analysis_range_value = st.date_input(
+            "분석 기간",
+            value=(default_analysis, default_analysis),
+            min_value=DATA_START_DATE,
             max_value=date.today(),
             format="YYYY/MM/DD",
         )
 
+    analysis_start, analysis_end = _normalize_range(
+        analysis_range_value
+    )
+
+    analysis_days_ui = _period_days(
+        analysis_start,
+        analysis_end,
+    )
+
     with c2:
+        first_compare_option = (
+            "전일"
+            if analysis_days_ui == 1
+            else "직전기간"
+        )
         compare_mode = st.radio(
             "비교 기준",
-            options=["전일", "전주", "4주평균", "Custom Date"],
+            options=[
+                first_compare_option,
+                "전주",
+                "4주평균",
+                "Custom Date",
+            ],
             horizontal=True,
         )
 
+    default_custom_start = max(
+        DATA_START_DATE,
+        analysis_start - timedelta(days=7),
+    )
+    default_custom_end = max(
+        DATA_START_DATE,
+        analysis_end - timedelta(days=7),
+    )
+
     with c3:
-        default_custom = analysis_date - timedelta(days=30)
-        custom_date = st.date_input(
+        custom_range_value = st.date_input(
             "Custom Date",
-            value=default_custom,
+            value=(default_custom_start, default_custom_end),
+            min_value=DATA_START_DATE,
             max_value=date.today(),
             disabled=compare_mode != "Custom Date",
             format="YYYY/MM/DD",
         )
 
+    custom_start, custom_end = _normalize_range(
+        custom_range_value
+    )
+
     with c4:
-        st.markdown("<div class='control-label button-label'>조회 실행</div>", unsafe_allow_html=True)
+        st.markdown(
+            "<div class='control-label button-label'>조회 실행</div>",
+            unsafe_allow_html=True,
+        )
         query_clicked = st.button(
             "GA4 조회",
             type="primary",
@@ -368,22 +442,49 @@ with st.container(border=True):
 
 
 if query_clicked:
-    compare_dates = comparison_dates(
-        target_date=analysis_date,
-        compare_mode=compare_mode,
-        custom_date=custom_date,
-    )
-
-    if analysis_date in compare_dates:
-        st.error("분석일과 비교일은 서로 달라야 합니다.")
-        st.stop()
-
     try:
+        compare_ranges = comparison_ranges(
+            target_start=analysis_start,
+            target_end=analysis_end,
+            compare_mode=compare_mode,
+            custom_start=custom_start,
+            custom_end=custom_end,
+        )
+
+        if compare_mode == "Custom Date":
+            if (
+                analysis_start == custom_start
+                and analysis_end == custom_end
+            ):
+                st.error("분석 기간과 Custom Date 기간은 서로 달라야 합니다.")
+                st.stop()
+
+        unavailable_ranges = [
+            (start, end)
+            for start, end in compare_ranges
+            if start < DATA_START_DATE
+        ]
+        if unavailable_ranges:
+            first_start, first_end = unavailable_ranges[0]
+            st.error(
+                "선택한 비교 기준의 비교 기간이 데이터 적재 시작일 "
+                "(2026-09-03) 이전을 포함합니다. "
+                f"비교 기간: {_period_text(first_start, first_end)}"
+            )
+            st.stop()
+
         with st.spinner("GA4 검색 데이터를 조회하고 있습니다..."):
-            current_rows = load_date_rows(analysis_date.isoformat())
+            current_rows = load_range_rows(
+                analysis_start.isoformat(),
+                analysis_end.isoformat(),
+            )
+
             compare_datasets = [
-                load_date_rows(day.isoformat())
-                for day in compare_dates
+                load_range_rows(
+                    start.isoformat(),
+                    end.isoformat(),
+                )
+                for start, end in compare_ranges
             ]
 
             available_datasets = [
@@ -393,19 +494,26 @@ if query_clicked:
             ]
 
             if compare_mode == "4주평균":
-                compare_rows = aggregate_average(available_datasets)
+                compare_rows = aggregate_average(
+                    compare_datasets
+                )
             else:
                 compare_rows = (
-                    available_datasets[0]
-                    if available_datasets
+                    compare_datasets[0]
+                    if compare_datasets
                     else []
                 )
 
         st.session_state["search_result"] = {
-            "analysis_date": analysis_date.isoformat(),
+            "analysis_start": analysis_start.isoformat(),
+            "analysis_end": analysis_end.isoformat(),
             "compare_mode": compare_mode,
-            "compare_dates": [day.isoformat() for day in compare_dates],
-            "custom_date": custom_date.isoformat(),
+            "compare_ranges": [
+                [start.isoformat(), end.isoformat()]
+                for start, end in compare_ranges
+            ],
+            "custom_start": custom_start.isoformat(),
+            "custom_end": custom_end.isoformat(),
             "current_rows": current_rows,
             "compare_rows": compare_rows,
             "available_count": len(available_datasets),
@@ -420,7 +528,7 @@ if query_clicked:
 result = st.session_state.get("search_result")
 
 if result is None:
-    st.info("분석일과 비교 기준을 선택한 뒤 **GA4 조회**를 눌러주세요.")
+    st.info("분석 기간과 비교 기준을 선택한 뒤 **GA4 조회**를 눌러주세요.")
     st.stop()
 
 
@@ -429,37 +537,85 @@ compare_rows = result["compare_rows"]
 current_total = _safe_total(current_rows)
 compare_total = _safe_total(compare_rows)
 compare_mode_result = result["compare_mode"]
-compare_dates_result = result["compare_dates"]
+
+result_analysis_start = date.fromisoformat(
+    result["analysis_start"]
+)
+result_analysis_end = date.fromisoformat(
+    result["analysis_end"]
+)
+
+compare_ranges_result = [
+    (
+        date.fromisoformat(start),
+        date.fromisoformat(end),
+    )
+    for start, end in result["compare_ranges"]
+]
+
+analysis_period_text = _period_text(
+    result_analysis_start,
+    result_analysis_end,
+)
+analysis_days = _period_days(
+    result_analysis_start,
+    result_analysis_end,
+)
 
 if compare_mode_result == "4주평균":
-    compare_date_text = " / ".join(compare_dates_result)
+    compare_period_text = " / ".join(
+        _period_text(start, end)
+        for start, end in compare_ranges_result
+    )
     compare_column_name = "4주 평균 조회수"
 else:
-    compare_date_text = compare_dates_result[0]
-    compare_column_name = f"{_compare_label(compare_mode_result)} 조회수"
+    compare_start, compare_end = compare_ranges_result[0]
+    compare_period_text = _period_text(
+        compare_start,
+        compare_end,
+    )
+    compare_column_name = (
+        f"{_compare_label(compare_mode_result)} 조회수"
+    )
 
 st.markdown(
     f"""
     <div class="badge-row">
-      <span class="badge">분석일 <b>{result['analysis_date']}</b></span>
+      <span class="badge">분석 기간 <b>{analysis_period_text}</b></span>
+      <span class="badge">기간 <b>{analysis_days}일</b></span>
       <span class="badge">비교 <b>{_compare_label(compare_mode_result)}</b></span>
       <span class="badge">현재 조회수 <b>{_format_count(current_total)}</b></span>
       <span class="badge">비교 조회수 <b>{_format_count(compare_total)}</b></span>
-      <span class="badge">비교 날짜 <b>{compare_date_text}</b></span>
+      <span class="badge">비교 기간 <b>{compare_period_text}</b></span>
     </div>
     """,
     unsafe_allow_html=True,
 )
 
+if compare_mode_result == "Custom Date":
+    custom_compare_start, custom_compare_end = compare_ranges_result[0]
+    custom_days = _period_days(
+        custom_compare_start,
+        custom_compare_end,
+    )
+
+    if custom_days != analysis_days:
+        st.warning(
+            "분석 기간과 Custom Date 기간의 일수가 다릅니다. "
+            "현재 증감률은 각 기간의 조회수 합계를 직접 비교하므로 "
+            "기간 길이 차이의 영향을 받을 수 있습니다."
+        )
+
 if compare_mode_result == "4주평균" and result["available_count"] < 4:
     st.warning(
-        "4주 비교일 중 데이터가 존재하는 날짜만 평균에 사용했습니다. "
-        f"사용 가능 {result['available_count']}/4일"
+        "4주 비교 기간 중 검색 데이터가 없는 기간이 있습니다. "
+        "4주 평균에는 데이터가 없는 기간도 0으로 포함됩니다."
     )
 
 if not current_rows:
-    st.warning("선택한 분석일에 표시 가능한 검색어 데이터가 없습니다.")
+    st.warning("선택한 분석 기간에 표시 가능한 검색어 데이터가 없습니다.")
     st.stop()
+
 
 left, right = st.columns([1.05, 1.9], gap="large")
 
@@ -470,10 +626,13 @@ with left:
             unsafe_allow_html=True,
         )
         st.markdown(
-            '<div class="section-caption">분석일 조회수 상위 50개 검색어입니다.</div>',
+            '<div class="section-caption">분석 기간 조회수 상위 50개 검색어입니다.</div>',
             unsafe_allow_html=True,
         )
-        st.markdown("<div class='search-panel-offset'></div>", unsafe_allow_html=True)
+        st.markdown(
+            "<div class='search-panel-offset'></div>",
+            unsafe_allow_html=True,
+        )
 
         treemap_df = pd.DataFrame(current_rows[:50]).rename(
             columns={
@@ -504,7 +663,12 @@ with left:
                 "조회수 %{value:,.0f}"
                 "<extra></extra>"
             ),
-            marker=dict(line=dict(width=1, color="white")),
+            marker=dict(
+                line=dict(
+                    width=1,
+                    color="white",
+                )
+            ),
         )
 
         fig.update_layout(
@@ -527,11 +691,14 @@ with right:
             unsafe_allow_html=True,
         )
         st.markdown(
-            '<div class="section-caption">현재 조회수와 선택한 비교 기준 조회수를 비교합니다.</div>',
+            '<div class="section-caption">분석 기간과 선택한 비교 기간의 조회수 합계를 비교합니다.</div>',
             unsafe_allow_html=True,
         )
 
-        st.markdown('<div class="control-label">검색어 찾기</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="control-label">검색어 찾기</div>',
+            unsafe_allow_html=True,
+        )
         keyword = st.text_input(
             "검색어 찾기",
             placeholder="검색어를 입력하세요",
@@ -544,54 +711,69 @@ with right:
             compare_column_name=compare_column_name,
         )
 
-    if keyword.strip():
-        compare_df = compare_df[
-            compare_df["검색어"].str.contains(
-                keyword.strip(),
-                case=False,
-                na=False,
-            )
-        ]
-
-    display_df = compare_df.copy()
-
-    if not display_df.empty:
-        display_df["현재 조회수"] = display_df["현재 조회수"].round(0)
-        display_df[compare_column_name] = display_df[compare_column_name].round(1)
-        display_df["증감"] = display_df["증감률"].apply(_format_change)
-        display_df["현재 비중"] = display_df["현재 비중"].map(
-            lambda value: f"{value * 100:.2f}%"
-        )
-
-        display_df = display_df[
-            [
-                "검색어",
-                "현재 조회수",
-                compare_column_name,
-                "증감",
-                "현재 비중",
+        if keyword.strip():
+            compare_df = compare_df[
+                compare_df["검색어"].str.contains(
+                    keyword.strip(),
+                    case=False,
+                    na=False,
+                )
             ]
-        ]
 
-        styled_df = (
-            display_df.style
-            .format(
-                {
-                    "현재 조회수": "{:,.0f}",
-                    compare_column_name: "{:,.1f}" if compare_mode_result == "4주평균" else "{:,.0f}",
-                }
+        display_df = compare_df.copy()
+
+        if not display_df.empty:
+            display_df["현재 조회수"] = (
+                display_df["현재 조회수"].round(0)
             )
-            .map(_change_style, subset=["증감"])
-        )
+            display_df[compare_column_name] = (
+                display_df[compare_column_name].round(1)
+            )
+            display_df["증감"] = (
+                display_df["증감률"].apply(_format_change)
+            )
+            display_df["현재 비중"] = (
+                display_df["현재 비중"].map(
+                    lambda value: f"{value * 100:.2f}%"
+                )
+            )
 
-        st.dataframe(
-            styled_df,
-            use_container_width=True,
-            hide_index=True,
-            height=600,
-        )
-    else:
-        st.info("조건에 맞는 검색어가 없습니다.")
+            display_df = display_df[
+                [
+                    "검색어",
+                    "현재 조회수",
+                    compare_column_name,
+                    "증감",
+                    "현재 비중",
+                ]
+            ]
+
+            styled_df = (
+                display_df.style
+                .format(
+                    {
+                        "현재 조회수": "{:,.0f}",
+                        compare_column_name: (
+                            "{:,.1f}"
+                            if compare_mode_result == "4주평균"
+                            else "{:,.0f}"
+                        ),
+                    }
+                )
+                .map(
+                    _change_style,
+                    subset=["증감"],
+                )
+            )
+
+            st.dataframe(
+                styled_df,
+                use_container_width=True,
+                hide_index=True,
+                height=600,
+            )
+        else:
+            st.info("조건에 맞는 검색어가 없습니다.")
 
 st.caption(
     "검색량 기준: Web page_view + App screen_view의 screenPageViews · "
