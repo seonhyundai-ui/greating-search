@@ -13,6 +13,7 @@ TOKEN_FILE = ROOT / "token.json"
 
 SCOPES = [
     "https://www.googleapis.com/auth/analytics.readonly",
+    "https://www.googleapis.com/auth/webmasters.readonly",
 ]
 
 

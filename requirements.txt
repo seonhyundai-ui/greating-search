@@ -4,3 +4,4 @@ plotly
 google-analytics-data
 google-auth
 google-auth-oauthlib
+truststore
