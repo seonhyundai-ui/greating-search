@@ -17,11 +17,13 @@ from src.naver_spreadsheet_config import (
     get_spreadsheet_ids,
 )
 
-APP_VERSION = "0.4.0"
+APP_VERSION = "0.5.0"
 
 SHEET_NAME = "NAVER_FOOD_KEYWORD_RAW"
 TIMEZONE = ZoneInfo("Asia/Seoul")
 
+# 기존 6개 컬럼은 그대로 유지하고 G/H만 추가한다.
+# 따라서 기존 2025/2026 식품 전체 데이터 마이그레이션이 필요 없다.
 HEADERS = [
     "snapshot_date",
     "rank",
@@ -29,7 +31,38 @@ HEADERS = [
     "category_id",
     "category_name",
     "collected_at",
+    "scope_key",
+    "scope_name",
 ]
+
+SCOPES = [
+    {
+        "scope_key": "FOOD_ALL",
+        "scope_name": "식품 전체",
+        "category_id": "50000006",
+        "category_name": "식품",
+    },
+    {
+        "scope_key": "FROZEN_CONVENIENCE",
+        "scope_name": "냉동/간편조리식품",
+        "category_id": "50000026",
+        "category_name": "냉동/간편조리식품",
+    },
+    {
+        "scope_key": "MEALKIT",
+        "scope_name": "밀키트",
+        "category_id": "50014240",
+        "category_name": "밀키트",
+    },
+    {
+        "scope_key": "INSTANT_RICE_SOUP",
+        "scope_name": "즉석밥/즉석국",
+        "category_id": "50020779",
+        "category_name": "즉석밥/즉석국",
+    },
+]
+
+SCOPE_KEYS = {scope["scope_key"] for scope in SCOPES}
 
 LOG_DIR = Path("logs")
 LOG_FILE = LOG_DIR / "naver_food_daily.log"
@@ -74,6 +107,7 @@ def _yesterday_kst():
 
 def _date_range(start_date, end_date):
     current = start_date
+
     while current <= end_date:
         yield current
         current += timedelta(days=1)
@@ -81,31 +115,41 @@ def _date_range(start_date, end_date):
 
 def _get_sheets_service():
     creds = get_sheets_credentials()
-    return build("sheets", "v4", credentials=creds, cache_discovery=False)
+    return build(
+        "sheets",
+        "v4",
+        credentials=creds,
+        cache_discovery=False,
+    )
 
 
-def _get_sheet_id(service, spreadsheet_id: str) -> int | None:
+def _get_sheet_properties(service, spreadsheet_id: str):
     spreadsheet = (
         service.spreadsheets()
         .get(
             spreadsheetId=spreadsheet_id,
-            fields="sheets.properties(sheetId,title)",
+            fields=(
+                "sheets.properties("
+                "sheetId,title,gridProperties(rowCount,columnCount)"
+                ")"
+            ),
         )
         .execute()
     )
 
     for sheet in spreadsheet.get("sheets", []):
         props = sheet.get("properties", {})
+
         if props.get("title") == SHEET_NAME:
-            return props.get("sheetId")
+            return props
 
     return None
 
 
 def _ensure_sheet(service, spreadsheet_id: str) -> int:
-    sheet_id = _get_sheet_id(service, spreadsheet_id)
+    props = _get_sheet_properties(service, spreadsheet_id)
 
-    if sheet_id is None:
+    if props is None:
         response = (
             service.spreadsheets()
             .batchUpdate(
@@ -130,15 +174,45 @@ def _ensure_sheet(service, spreadsheet_id: str) -> int:
             .execute()
         )
 
-        sheet_id = response["replies"][0]["addSheet"]["properties"]["sheetId"]
+        props = response["replies"][0]["addSheet"]["properties"]
         LOGGER.info("[SHEETS] created sheet: %s", SHEET_NAME)
+
+    sheet_id = props["sheetId"]
+    column_count = int(
+        props.get("gridProperties", {}).get("columnCount", 0)
+    )
+
+    if column_count < len(HEADERS):
+        (
+            service.spreadsheets()
+            .batchUpdate(
+                spreadsheetId=spreadsheet_id,
+                body={
+                    "requests": [
+                        {
+                            "appendDimension": {
+                                "sheetId": sheet_id,
+                                "dimension": "COLUMNS",
+                                "length": len(HEADERS) - column_count,
+                            }
+                        }
+                    ]
+                },
+            )
+            .execute()
+        )
+        LOGGER.info(
+            "[SHEETS] columns expanded: %s -> %s",
+            column_count,
+            len(HEADERS),
+        )
 
     header_result = (
         service.spreadsheets()
         .values()
         .get(
             spreadsheetId=spreadsheet_id,
-            range=f"'{SHEET_NAME}'!A1:F1",
+            range=f"'{SHEET_NAME}'!A1:H1",
         )
         .execute()
     )
@@ -151,13 +225,13 @@ def _ensure_sheet(service, spreadsheet_id: str) -> int:
             .values()
             .update(
                 spreadsheetId=spreadsheet_id,
-                range=f"'{SHEET_NAME}'!A1:F1",
+                range=f"'{SHEET_NAME}'!A1:H1",
                 valueInputOption="RAW",
                 body={"values": [HEADERS]},
             )
             .execute()
         )
-        LOGGER.info("[SHEETS] header created/updated")
+        LOGGER.info("[SHEETS] header created/updated to 8 columns")
 
     (
         service.spreadsheets()
@@ -169,7 +243,9 @@ def _ensure_sheet(service, spreadsheet_id: str) -> int:
                         "updateSheetProperties": {
                             "properties": {
                                 "sheetId": sheet_id,
-                                "gridProperties": {"frozenRowCount": 1},
+                                "gridProperties": {
+                                    "frozenRowCount": 1
+                                },
                             },
                             "fields": "gridProperties.frozenRowCount",
                         }
@@ -185,10 +261,15 @@ def _ensure_sheet(service, spreadsheet_id: str) -> int:
                             },
                             "cell": {
                                 "userEnteredFormat": {
-                                    "textFormat": {"bold": True}
+                                    "textFormat": {
+                                        "bold": True
+                                    }
                                 }
                             },
-                            "fields": "userEnteredFormat.textFormat.bold",
+                            "fields": (
+                                "userEnteredFormat."
+                                "textFormat.bold"
+                            ),
                         }
                     },
                 ]
@@ -200,50 +281,72 @@ def _ensure_sheet(service, spreadsheet_id: str) -> int:
     return sheet_id
 
 
-def _read_snapshot_dates(service, spreadsheet_id: str) -> list[str]:
+def _read_snapshot_scope_rows(
+    service,
+    spreadsheet_id: str,
+):
     try:
         result = (
             service.spreadsheets()
             .values()
             .get(
                 spreadsheetId=spreadsheet_id,
-                range=f"'{SHEET_NAME}'!A2:A",
+                range=f"'{SHEET_NAME}'!A2:H",
             )
             .execute()
         )
     except Exception:
-        # 파일은 있지만 RAW 탭이 아직 없는 신규 연도는 빈 상태로 취급
         return []
 
     values = result.get("values", [])
-    dates: list[str] = []
+    parsed = []
 
-    for row in values:
-        if not row:
-            continue
-
-        value = str(row[0]).strip()
+    for idx, row in enumerate(values, start=2):
+        padded = list(row) + [""] * (8 - len(row))
+        snapshot_date = str(padded[0]).strip()
 
         try:
-            _parse_date(value)
+            _parse_date(snapshot_date)
         except ValueError:
             continue
 
-        dates.append(value)
+        category_id = str(padded[3]).strip()
+        scope_key = str(padded[6]).strip()
 
-    return dates
+        # 기존 6컬럼 데이터는 모두 '식품 전체'로 간주.
+        if not scope_key:
+            if category_id == "50000006":
+                scope_key = "FOOD_ALL"
+            else:
+                scope_key = f"LEGACY_{category_id or 'UNKNOWN'}"
+
+        parsed.append(
+            {
+                "row_number": idx,
+                "snapshot_date": snapshot_date,
+                "scope_key": scope_key,
+            }
+        )
+
+    return parsed
 
 
 def _get_latest_snapshot_date(service):
     latest = None
 
     for year, spreadsheet_id in get_spreadsheet_ids().items():
-        dates = _read_snapshot_dates(service, spreadsheet_id)
+        rows = _read_snapshot_scope_rows(
+            service,
+            spreadsheet_id,
+        )
 
-        if not dates:
+        if not rows:
             continue
 
-        year_latest = max(_parse_date(value) for value in dates)
+        year_latest = max(
+            _parse_date(row["snapshot_date"])
+            for row in rows
+        )
 
         if latest is None or year_latest > latest:
             latest = year_latest
@@ -251,28 +354,42 @@ def _get_latest_snapshot_date(service):
     return latest
 
 
-def _existing_snapshot_rows(
+def _existing_scope_rows(
     service,
     spreadsheet_id: str,
     target_date: str,
+    scope_key: str,
 ) -> list[int]:
-    result = (
-        service.spreadsheets()
-        .values()
-        .get(
-            spreadsheetId=spreadsheet_id,
-            range=f"'{SHEET_NAME}'!A2:A",
-        )
-        .execute()
+    rows = _read_snapshot_scope_rows(
+        service,
+        spreadsheet_id,
     )
 
-    values = result.get("values", [])
-
     return [
-        idx + 2
-        for idx, row in enumerate(values)
-        if row and str(row[0]).strip() == target_date
+        row["row_number"]
+        for row in rows
+        if (
+            row["snapshot_date"] == target_date
+            and row["scope_key"] == scope_key
+        )
     ]
+
+
+def _scope_keys_for_date(
+    service,
+    spreadsheet_id: str,
+    target_date: str,
+) -> set[str]:
+    rows = _read_snapshot_scope_rows(
+        service,
+        spreadsheet_id,
+    )
+
+    return {
+        row["scope_key"]
+        for row in rows
+        if row["snapshot_date"] == target_date
+    }
 
 
 def _delete_rows(
@@ -323,7 +440,13 @@ def _delete_rows(
     )
 
 
-def _append_dataframe(service, spreadsheet_id: str, df) -> int:
+def _append_dataframe(
+    service,
+    spreadsheet_id: str,
+    df,
+    scope_key: str,
+    scope_name: str,
+) -> int:
     values = [
         [
             str(row.snapshot_date),
@@ -332,6 +455,8 @@ def _append_dataframe(service, spreadsheet_id: str, df) -> int:
             str(row.category_id),
             str(row.category_name),
             str(row.collected_at),
+            scope_key,
+            scope_name,
         ]
         for row in df.itertuples(index=False)
     ]
@@ -341,7 +466,7 @@ def _append_dataframe(service, spreadsheet_id: str, df) -> int:
         .values()
         .append(
             spreadsheetId=spreadsheet_id,
-            range=f"'{SHEET_NAME}'!A:F",
+            range=f"'{SHEET_NAME}'!A:H",
             valueInputOption="RAW",
             insertDataOption="INSERT_ROWS",
             body={"values": values},
@@ -349,52 +474,70 @@ def _append_dataframe(service, spreadsheet_id: str, df) -> int:
         .execute()
     )
 
-    return int(response.get("updates", {}).get("updatedRows", 0))
-
-
-def _collect_and_upload_one(
-    service,
-    target_date: str,
-    replace: bool = False,
-) -> str:
-    target = _parse_date(target_date)
-    spreadsheet_id = get_spreadsheet_id(target.year)
-    sheet_id = _ensure_sheet(service, spreadsheet_id)
-
-    LOGGER.info(
-        "[TARGET] %s -> NAVER_SEARCH_%s",
-        target_date,
-        target.year,
+    return int(
+        response.get(
+            "updates",
+            {},
+        ).get(
+            "updatedRows",
+            0,
+        )
     )
 
-    existing_rows = _existing_snapshot_rows(
+
+def _collect_and_upload_scope(
+    service,
+    spreadsheet_id: str,
+    sheet_id: int,
+    target_date: str,
+    scope: dict,
+    replace: bool = False,
+) -> str:
+    scope_key = scope["scope_key"]
+    scope_name = scope["scope_name"]
+
+    existing_rows = _existing_scope_rows(
         service,
         spreadsheet_id,
         target_date,
+        scope_key,
     )
 
     if existing_rows and not replace:
         LOGGER.info(
-            "[SKIP] %s 데이터가 이미 %s행 존재합니다.",
+            "[SKIP] %s | %s already exists rows=%s",
             target_date,
+            scope_name,
             len(existing_rows),
         )
         return "SKIP"
 
-    LOGGER.info("[NAVER] %s TOP 500 수집", target_date)
-    df = fetch_food_keyword_rank(target_date=target_date)
+    LOGGER.info(
+        "[NAVER] %s | %s TOP 500 수집",
+        target_date,
+        scope_name,
+    )
+
+    df = fetch_food_keyword_rank(
+        target_date=target_date,
+        category_id=scope["category_id"],
+        category_name=scope["category_name"],
+    )
 
     if len(df) != 500:
         raise RuntimeError(
-            f"{target_date} NAVER 응답 행수 이상: expected=500, got={len(df)}"
+            f"{target_date} / {scope_name} NAVER 응답 행수 이상: "
+            f"expected=500, got={len(df)}"
         )
 
     if existing_rows and replace:
         LOGGER.info(
-            "[REPLACE] %s existing rows=%s -> delete",
+            "[REPLACE] %s | %s rows=%s -> delete",
             target_date,
+            scope_name,
             len(existing_rows),
         )
+
         _delete_rows(
             service,
             spreadsheet_id,
@@ -406,21 +549,88 @@ def _collect_and_upload_one(
         service,
         spreadsheet_id,
         df,
+        scope_key,
+        scope_name,
     )
 
     if updated_rows != len(df):
         raise RuntimeError(
-            f"{target_date} Google Sheets 적재 행수 불일치: "
+            f"{target_date} / {scope_name} Google Sheets 적재 행수 불일치: "
             f"expected={len(df)}, updated={updated_rows}"
         )
 
     LOGGER.info(
-        "[SUCCESS] %s rows=%s | year=%s",
+        "[SUCCESS] %s | %s rows=%s",
         target_date,
+        scope_name,
         updated_rows,
-        target.year,
     )
     return "SUCCESS"
+
+
+def _collect_and_upload_date(
+    service,
+    target_date: str,
+    replace: bool = False,
+) -> dict[str, int]:
+    target = _parse_date(target_date)
+    spreadsheet_id = get_spreadsheet_id(target.year)
+    sheet_id = _ensure_sheet(
+        service,
+        spreadsheet_id,
+    )
+
+    LOGGER.info(
+        "[TARGET] %s -> NAVER_SEARCH_%s",
+        target_date,
+        target.year,
+    )
+
+    stats = {
+        "SUCCESS": 0,
+        "SKIP": 0,
+    }
+
+    for index, scope in enumerate(SCOPES, start=1):
+        LOGGER.info(
+            "[SCOPE %s/%s] %s",
+            index,
+            len(SCOPES),
+            scope["scope_name"],
+        )
+
+        result = _collect_and_upload_scope(
+            service=service,
+            spreadsheet_id=spreadsheet_id,
+            sheet_id=sheet_id,
+            target_date=target_date,
+            scope=scope,
+            replace=replace,
+        )
+
+        stats[result] += 1
+
+    return stats
+
+
+def _latest_date_needs_scope_backfill(
+    service,
+    latest_date,
+) -> bool:
+    if latest_date is None:
+        return False
+
+    spreadsheet_id = get_spreadsheet_id(
+        latest_date.year
+    )
+
+    existing = _scope_keys_for_date(
+        service,
+        spreadsheet_id,
+        latest_date.isoformat(),
+    )
+
+    return not SCOPE_KEYS.issubset(existing)
 
 
 def run_catchup() -> None:
@@ -436,44 +646,65 @@ def run_catchup() -> None:
             end_date.isoformat(),
         )
     else:
-        start_date = latest_date + timedelta(days=1)
-        LOGGER.info(
-            "[AUTO] latest=%s | catch-up=%s ~ %s",
-            latest_date.isoformat(),
-            start_date.isoformat(),
-            end_date.isoformat(),
-        )
+        # 기존 최신 날짜가 FOOD_ALL만 있는 경우,
+        # 그 날짜부터 다시 시작해 누락된 3개 세부 분류를 채운다.
+        if _latest_date_needs_scope_backfill(
+            service,
+            latest_date,
+        ):
+            start_date = latest_date
+            LOGGER.info(
+                "[AUTO] latest=%s has missing scopes -> "
+                "same date부터 세부분류 보충",
+                latest_date.isoformat(),
+            )
+        else:
+            start_date = latest_date + timedelta(days=1)
+            LOGGER.info(
+                "[AUTO] latest=%s complete | catch-up=%s ~ %s",
+                latest_date.isoformat(),
+                start_date.isoformat(),
+                end_date.isoformat(),
+            )
 
     if start_date > end_date:
         LOGGER.info(
-            "[UP-TO-DATE] 최신 적재일=%s | D-1=%s | 추가 적재 없음",
+            "[UP-TO-DATE] latest=%s | D-1=%s | 추가 적재 없음",
             latest_date.isoformat() if latest_date else "-",
             end_date.isoformat(),
         )
         return
 
-    targets = list(_date_range(start_date, end_date))
+    targets = list(
+        _date_range(
+            start_date,
+            end_date,
+        )
+    )
 
     LOGGER.info(
         "[CATCH-UP] %s일 적재 예정: %s",
         len(targets),
-        ", ".join(d.isoformat() for d in targets),
+        ", ".join(
+            date.isoformat()
+            for date in targets
+        ),
     )
 
-    success_count = 0
+    completed_dates = 0
 
     for index, target in enumerate(targets, start=1):
         target_str = target.isoformat()
 
         LOGGER.info(
-            "[%s/%s] %s 시작",
+            "[DATE %s/%s] %s 시작",
             index,
             len(targets),
             target_str,
         )
 
         try:
-            result = _collect_and_upload_one(
+            stats = _collect_and_upload_date(
                 service=service,
                 target_date=target_str,
                 replace=False,
@@ -486,23 +717,31 @@ def run_catchup() -> None:
                     target_str,
                 )
                 LOGGER.info(
-                    "[CATCH-UP STOP] %s 이후 데이터는 다음 실행에서 다시 확인합니다.",
+                    "[CATCH-UP STOP] %s 이후 데이터는 "
+                    "다음 실행에서 다시 확인합니다.",
                     target_str,
                 )
                 return
             raise
 
-        if result == "SUCCESS":
-            success_count += 1
+        LOGGER.info(
+            "[DATE COMPLETE] %s | success_scopes=%s | skip_scopes=%s",
+            target_str,
+            stats["SUCCESS"],
+            stats["SKIP"],
+        )
+        completed_dates += 1
 
     LOGGER.info(
-        "[CATCH-UP COMPLETE] requested=%s | success=%s",
-        len(targets),
-        success_count,
+        "[CATCH-UP COMPLETE] dates=%s",
+        completed_dates,
     )
 
 
-def run_manual(target_date: str, replace: bool = False) -> None:
+def run_manual(
+    target_date: str,
+    replace: bool = False,
+) -> None:
     _parse_date(target_date)
     service = _get_sheets_service()
 
@@ -512,7 +751,7 @@ def run_manual(target_date: str, replace: bool = False) -> None:
         replace,
     )
 
-    _collect_and_upload_one(
+    _collect_and_upload_date(
         service=service,
         target_date=target_date,
         replace=replace,
@@ -522,8 +761,8 @@ def run_manual(target_date: str, replace: bool = False) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "NAVER 식품 인기검색어 TOP 500 -> 연도별 Google Sheets 누적. "
-            "날짜 생략 시 전체 연도 파일의 마지막 적재일 다음날부터 KST D-1까지 자동 보충."
+            "NAVER 식품 전체 + 3개 세부분류 TOP500 -> 연도별 Google Sheets 누적. "
+            "날짜 생략 시 최신 날짜의 누락 분류를 보충한 뒤 D-1까지 자동 적재."
         )
     )
 
@@ -537,15 +776,28 @@ def main() -> None:
     parser.add_argument(
         "--replace",
         action="store_true",
-        help="수동 날짜가 이미 있으면 삭제 후 재적재",
+        help="수동 날짜의 4개 분류를 모두 삭제 후 재적재",
     )
 
     args = parser.parse_args()
 
     LOGGER.info("=" * 72)
-    LOGGER.info("NAVER Food -> Yearly Google Sheets v%s", APP_VERSION)
-    LOGGER.info("Configured years : %s", configured_years())
-    LOGGER.info("Sheet            : %s", SHEET_NAME)
+    LOGGER.info(
+        "NAVER Food Scope Pipeline v%s",
+        APP_VERSION,
+    )
+    LOGGER.info(
+        "Configured years : %s",
+        configured_years(),
+    )
+    LOGGER.info(
+        "Scopes           : %s",
+        [scope["scope_name"] for scope in SCOPES],
+    )
+    LOGGER.info(
+        "Sheet            : %s",
+        SHEET_NAME,
+    )
     LOGGER.info("=" * 72)
 
     try:
@@ -557,8 +809,9 @@ def main() -> None:
         else:
             if args.replace:
                 raise ValueError(
-                    "--replace는 target_date를 직접 지정한 수동 실행에서만 사용할 수 있습니다."
+                    "--replace는 target_date를 지정한 수동 실행에서만 사용할 수 있습니다."
                 )
+
             run_catchup()
 
     except Exception:

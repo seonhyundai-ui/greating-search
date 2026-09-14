@@ -10,7 +10,9 @@ from src.app_auth import render_footer, require_authenticated
 
 from src.naver_food_dashboard import (
     available_dates,
+    available_scopes,
     build_top_table,
+    filter_scope,
     format_rank_change,
     keyword_history,
     load_naver_food_history,
@@ -18,7 +20,7 @@ from src.naver_food_dashboard import (
     snapshot,
 )
 
-APP_VERSION = "0.1.3"
+APP_VERSION = "0.2.0"
 RANK_JUMP_THRESHOLD = 20
 
 
@@ -187,7 +189,7 @@ st.markdown(
 )
 st.markdown(
     '<div class="page-subtitle">'
-    'NAVER 데이터랩 쇼핑인사이트 「식품」 인기검색어 TOP 500 스냅샷 기반'
+    'NAVER 데이터랩 쇼핑인사이트 식품 카테고리 인기검색어 TOP 500 스냅샷 기반'
     '</div>',
     unsafe_allow_html=True,
 )
@@ -206,19 +208,64 @@ except Exception as exc:
     st.exception(exc)
     st.stop()
 
-dates = available_dates(history_df)
+scope_options = available_scopes(history_df)
 
-if not dates:
-    st.warning("NAVER_FOOD_KEYWORD_RAW에 적재된 데이터가 없습니다.")
+if not scope_options:
+    st.warning("NAVER_FOOD_KEYWORD_RAW에 조회 가능한 분류 데이터가 없습니다.")
     st.stop()
 
-min_date = min(dates)
-max_date = max(dates)
+scope_name_to_key = {
+    name: key
+    for key, name in scope_options
+}
+
+scope_names = [
+    name
+    for _, name in scope_options
+]
+
+selected_scope_name = st.session_state.get(
+    "naver_scope_name",
+    scope_names[0],
+)
+
+if selected_scope_name not in scope_names:
+    selected_scope_name = scope_names[0]
 
 with st.container(border=True):
-    c1, c2 = st.columns([1.15, 3.85])
+    c1, c2, c3 = st.columns([1.25, 1.25, 2.5])
 
     with c1:
+        selected_scope_name = st.selectbox(
+            "분류",
+            options=scope_names,
+            index=scope_names.index(selected_scope_name),
+            key="naver_scope_name",
+        )
+
+    selected_scope_key = scope_name_to_key[
+        selected_scope_name
+    ]
+
+    scoped_history_df = filter_scope(
+        history_df,
+        selected_scope_key,
+    )
+
+    dates = available_dates(
+        scoped_history_df
+    )
+
+    if not dates:
+        st.warning(
+            f"{selected_scope_name} 데이터가 아직 적재되지 않았습니다."
+        )
+        st.stop()
+
+    min_date = min(dates)
+    max_date = max(dates)
+
+    with c2:
         analysis_date = st.date_input(
             "분석일",
             value=max_date,
@@ -226,19 +273,26 @@ with st.container(border=True):
             max_value=max_date,
         )
 
-    with c2:
-        st.markdown("<div style='height: 1.8rem;'></div>", unsafe_allow_html=True)
+    with c3:
+        st.markdown(
+            "<div style='height: 1.8rem;'></div>",
+            unsafe_allow_html=True,
+        )
         st.caption(
+            f"{selected_scope_name} · "
             f"적재 기간 {min_date.isoformat()} ~ {max_date.isoformat()} · "
             f"급상승/급락 기준 ±{RANK_JUMP_THRESHOLD}위"
         )
 
 if analysis_date not in dates:
     st.warning(
-        f"{analysis_date.isoformat()} 데이터가 아직 적재되지 않았습니다. "
-        "다른 분석일을 선택해 주세요."
+        f"{selected_scope_name}의 {analysis_date.isoformat()} 데이터가 "
+        "아직 적재되지 않았습니다. 다른 분석일을 선택해 주세요."
     )
     st.stop()
+
+# 이후 모든 분석은 선택한 분류로 필터된 데이터만 사용
+history_df = scoped_history_df
 
 current = snapshot(history_df, analysis_date)
 prev_day_date = analysis_date - timedelta(days=1)
@@ -344,7 +398,7 @@ left_panel, right_panel = st.columns([1.55, 1.0])
 
 with left_panel:
     st.markdown(
-        f'<div class="section-title">{analysis_date.isoformat()} 식품 인기검색어 TOP 500</div>',
+        f'<div class="section-title">{analysis_date.isoformat()} {selected_scope_name} 인기검색어 TOP 500</div>',
         unsafe_allow_html=True,
     )
     st.markdown(

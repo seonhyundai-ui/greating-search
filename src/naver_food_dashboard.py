@@ -12,14 +12,26 @@ from src.naver_spreadsheet_config import get_spreadsheet_ids
 SHEET_NAME = "NAVER_FOOD_KEYWORD_RAW"
 LOCAL_TOKEN_FILE = Path("token_sheets.json")
 
+SCOPE_ORDER = [
+    "FOOD_ALL",
+    "FROZEN_CONVENIENCE",
+    "MEALKIT",
+    "INSTANT_RICE_SOUP",
+]
+
+SCOPE_NAMES = {
+    "FOOD_ALL": "식품 전체",
+    "FROZEN_CONVENIENCE": "냉동/간편조리식품",
+    "MEALKIT": "밀키트",
+    "INSTANT_RICE_SOUP": "즉석밥/즉석국",
+}
+
 
 def _cloud_credentials() -> Credentials | None:
-    """
-    Streamlit Cloud에서는 Google Sheets 전용 OAuth를 우선 사용한다.
-    token_sheets.json으로 발급한 refresh token 값을
-    [google_sheets_oauth]에 넣는 것을 권장한다.
-    """
-    for section_name in ("google_sheets_oauth", "google_oauth"):
+    for section_name in (
+        "google_sheets_oauth",
+        "google_oauth",
+    ):
         if section_name not in st.secrets:
             continue
 
@@ -31,7 +43,10 @@ def _cloud_credentials() -> Credentials | None:
             "client_secret",
         )
 
-        if not all(section.get(key) for key in required):
+        if not all(
+            section.get(key)
+            for key in required
+        ):
             continue
 
         return Credentials(
@@ -53,8 +68,7 @@ def get_sheets_read_credentials() -> Credentials:
 
     if not LOCAL_TOKEN_FILE.exists():
         raise FileNotFoundError(
-            "로컬 token_sheets.json을 찾을 수 없습니다. "
-            "먼저 NAVER 수집/Sheets 적재 인증을 완료하세요."
+            "로컬 token_sheets.json을 찾을 수 없습니다."
         )
 
     return Credentials.from_authorized_user_file(
@@ -71,6 +85,8 @@ def _empty_frame() -> pd.DataFrame:
             "category_id",
             "category_name",
             "collected_at",
+            "scope_key",
+            "scope_name",
         ]
     )
 
@@ -80,8 +96,6 @@ def _load_one_spreadsheet(
     year: int,
     spreadsheet_id: str,
 ) -> pd.DataFrame:
-    # 미래 연도 Spreadsheet를 미리 등록해두더라도
-    # NAVER_FOOD_KEYWORD_RAW 탭이 아직 없다면 오류가 아니라 빈 연도로 건너뛴다.
     try:
         metadata = (
             service.spreadsheets()
@@ -98,8 +112,14 @@ def _load_one_spreadsheet(
         ) from exc
 
     sheet_titles = {
-        sheet.get("properties", {}).get("title", "")
-        for sheet in metadata.get("sheets", [])
+        sheet.get("properties", {}).get(
+            "title",
+            "",
+        )
+        for sheet in metadata.get(
+            "sheets",
+            [],
+        )
     }
 
     if SHEET_NAME not in sheet_titles:
@@ -111,7 +131,7 @@ def _load_one_spreadsheet(
             .values()
             .get(
                 spreadsheetId=spreadsheet_id,
-                range=f"'{SHEET_NAME}'!A:F",
+                range=f"'{SHEET_NAME}'!A:H",
             )
             .execute()
         )
@@ -125,24 +145,61 @@ def _load_one_spreadsheet(
     if len(values) <= 1:
         return _empty_frame()
 
-    header = values[0]
+    header = list(values[0])
     rows = values[1:]
-    width = len(header)
+
+    # 기존 A:F 6컬럼 시트도 읽을 수 있게 G/H 헤더를 가상 추가한다.
+    expected = [
+        "snapshot_date",
+        "rank",
+        "keyword",
+        "category_id",
+        "category_name",
+        "collected_at",
+        "scope_key",
+        "scope_name",
+    ]
+
+    width = max(
+        len(header),
+        len(expected),
+    )
+
+    if len(header) < len(expected):
+        header = header + expected[len(header):]
 
     normalized = []
-    for row in rows:
-        row = list(row) + [""] * (width - len(row))
-        normalized.append(row[:width])
 
-    df = pd.DataFrame(normalized, columns=header)
+    for row in rows:
+        row = list(row) + [""] * (
+            len(header) - len(row)
+        )
+        normalized.append(
+            row[:len(header)]
+        )
+
+    df = pd.DataFrame(
+        normalized,
+        columns=header,
+    )
+
+    for column in expected:
+        if column not in df.columns:
+            df[column] = ""
+
+    df = df[expected].copy()
     df["_source_year"] = year
 
     return df
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(
+    ttl=300,
+    show_spinner=False,
+)
 def load_naver_food_history() -> pd.DataFrame:
     creds = get_sheets_read_credentials()
+
     service = build(
         "sheets",
         "v4",
@@ -172,24 +229,10 @@ def load_naver_food_history() -> pd.DataFrame:
     if not frames:
         return _empty_frame()
 
-    df = pd.concat(frames, ignore_index=True)
-
-    required = {
-        "snapshot_date",
-        "rank",
-        "keyword",
-        "category_id",
-        "category_name",
-        "collected_at",
-    }
-
-    missing = required - set(df.columns)
-
-    if missing:
-        raise ValueError(
-            "NAVER_FOOD_KEYWORD_RAW 컬럼이 예상과 다릅니다. "
-            f"missing={sorted(missing)}"
-        )
+    df = pd.concat(
+        frames,
+        ignore_index=True,
+    )
 
     df["snapshot_date"] = pd.to_datetime(
         df["snapshot_date"],
@@ -207,22 +250,86 @@ def load_naver_food_history() -> pd.DataFrame:
         .str.strip()
     )
 
+    df["category_id"] = (
+        df["category_id"]
+        .astype(str)
+        .str.strip()
+    )
+
+    df["scope_key"] = (
+        df["scope_key"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+
+    df["scope_name"] = (
+        df["scope_name"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+
+    # 기존 6컬럼 데이터는 식품 전체로 간주.
+    legacy_food_mask = (
+        (df["scope_key"] == "")
+        & (df["category_id"] == "50000006")
+    )
+
+    df.loc[
+        legacy_food_mask,
+        "scope_key",
+    ] = "FOOD_ALL"
+
+    df.loc[
+        legacy_food_mask,
+        "scope_name",
+    ] = "식품 전체"
+
+    # 새 데이터인데 scope_name만 빈 경우 설정값으로 보완.
+    for key, name in SCOPE_NAMES.items():
+        mask = (
+            (df["scope_key"] == key)
+            & (df["scope_name"] == "")
+        )
+
+        df.loc[
+            mask,
+            "scope_name",
+        ] = name
+
     df = df.dropna(
-        subset=["snapshot_date", "rank"]
+        subset=[
+            "snapshot_date",
+            "rank",
+        ]
     )
 
     df = df[
         df["keyword"] != ""
     ].copy()
 
-    df["rank"] = df["rank"].astype(int)
+    df["rank"] = (
+        df["rank"]
+        .astype(int)
+    )
 
+    # 같은 날짜/분류/순위 중복 시 마지막 적재값 사용.
     df = (
         df.sort_values(
-            ["snapshot_date", "rank", "collected_at"]
+            [
+                "snapshot_date",
+                "scope_key",
+                "rank",
+                "collected_at",
+            ]
         )
         .drop_duplicates(
-            subset=["snapshot_date", "rank"],
+            subset=[
+                "snapshot_date",
+                "scope_key",
+                "rank",
+            ],
             keep="last",
         )
         .reset_index(drop=True)
@@ -231,7 +338,49 @@ def load_naver_food_history() -> pd.DataFrame:
     return df
 
 
-def available_dates(df: pd.DataFrame) -> list:
+def available_scopes(
+    df: pd.DataFrame,
+) -> list[tuple[str, str]]:
+    if df.empty:
+        return []
+
+    present = set(
+        df["scope_key"]
+        .dropna()
+        .astype(str)
+        .tolist()
+    )
+
+    result = []
+
+    for key in SCOPE_ORDER:
+        if key in present:
+            result.append(
+                (
+                    key,
+                    SCOPE_NAMES[key],
+                )
+            )
+
+    return result
+
+
+def filter_scope(
+    df: pd.DataFrame,
+    scope_key: str,
+) -> pd.DataFrame:
+    return (
+        df[
+            df["scope_key"] == scope_key
+        ]
+        .copy()
+        .reset_index(drop=True)
+    )
+
+
+def available_dates(
+    df: pd.DataFrame,
+) -> list:
     if df.empty:
         return []
 
@@ -248,7 +397,9 @@ def snapshot(
     target_date,
 ) -> pd.DataFrame:
     return (
-        df[df["snapshot_date"] == target_date]
+        df[
+            df["snapshot_date"] == target_date
+        ]
         .sort_values("rank")
         .reset_index(drop=True)
         .copy()
@@ -259,9 +410,16 @@ def rank_map(
     df: pd.DataFrame,
     target_date,
 ) -> dict[str, int]:
-    day = snapshot(df, target_date)
+    day = snapshot(
+        df,
+        target_date,
+    )
+
     return dict(
-        zip(day["keyword"], day["rank"])
+        zip(
+            day["keyword"],
+            day["rank"],
+        )
     )
 
 
@@ -271,7 +429,10 @@ def build_top_table(
     top_n: int = 500,
 ) -> pd.DataFrame:
     current = (
-        snapshot(df, analysis_date)
+        snapshot(
+            df,
+            analysis_date,
+        )
         .head(top_n)
         .copy()
     )
@@ -281,26 +442,53 @@ def build_top_table(
 
     from datetime import timedelta
 
-    prev_day = analysis_date - timedelta(days=1)
-    prev_week = analysis_date - timedelta(days=7)
+    prev_day = (
+        analysis_date
+        - timedelta(days=1)
+    )
 
-    day_map = rank_map(df, prev_day)
-    week_map = rank_map(df, prev_week)
+    prev_week = (
+        analysis_date
+        - timedelta(days=7)
+    )
 
-    current["전일 순위"] = current["keyword"].map(day_map)
-    current["전주 순위"] = current["keyword"].map(week_map)
+    day_map = rank_map(
+        df,
+        prev_day,
+    )
+
+    week_map = rank_map(
+        df,
+        prev_week,
+    )
+
+    current["전일 순위"] = (
+        current["keyword"]
+        .map(day_map)
+    )
+
+    current["전주 순위"] = (
+        current["keyword"]
+        .map(week_map)
+    )
 
     current["전일 변동"] = current.apply(
         lambda row: None
         if pd.isna(row["전일 순위"])
-        else int(row["전일 순위"]) - int(row["rank"]),
+        else (
+            int(row["전일 순위"])
+            - int(row["rank"])
+        ),
         axis=1,
     )
 
     current["전주 변동"] = current.apply(
         lambda row: None
         if pd.isna(row["전주 순위"])
-        else int(row["전주 순위"]) - int(row["rank"]),
+        else (
+            int(row["전주 순위"])
+            - int(row["rank"])
+        ),
         axis=1,
     )
 
@@ -314,7 +502,10 @@ def format_rank_change(
     if pd.isna(previous_rank):
         return "신규"
 
-    change = int(previous_rank) - int(current_rank)
+    change = (
+        int(previous_rank)
+        - int(current_rank)
+    )
 
     if change > 0:
         return f"▲ {change}"
@@ -333,7 +524,12 @@ def keyword_history(
 ) -> pd.DataFrame:
     from datetime import timedelta
 
-    start_date = end_date - timedelta(days=days - 1)
+    start_date = (
+        end_date
+        - timedelta(
+            days=days - 1,
+        )
+    )
 
     dates = pd.DataFrame(
         {
@@ -347,9 +543,20 @@ def keyword_history(
 
     subset = df[
         (df["keyword"] == keyword)
-        & (df["snapshot_date"] >= start_date)
-        & (df["snapshot_date"] <= end_date)
-    ][["snapshot_date", "rank"]].copy()
+        & (
+            df["snapshot_date"]
+            >= start_date
+        )
+        & (
+            df["snapshot_date"]
+            <= end_date
+        )
+    ][
+        [
+            "snapshot_date",
+            "rank",
+        ]
+    ].copy()
 
     history = dates.merge(
         subset,
@@ -362,10 +569,15 @@ def keyword_history(
         .fillna(501)
     )
 
-    history["status"] = history["rank"].apply(
-        lambda x: "TOP500 밖"
-        if pd.isna(x)
-        else f"{int(x)}위"
+    history["status"] = (
+        history["rank"]
+        .apply(
+            lambda x: (
+                "TOP500 밖"
+                if pd.isna(x)
+                else f"{int(x)}위"
+            )
+        )
     )
 
     return history
