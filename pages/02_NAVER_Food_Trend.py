@@ -12,15 +12,15 @@ from src.naver_food_dashboard import (
     available_dates,
     available_scopes,
     build_top_table,
-    filter_scope,
     format_rank_change,
     keyword_history,
-    load_naver_food_history,
+    load_naver_food_analysis_history,
+    load_naver_food_meta,
     rank_map,
     snapshot,
 )
 
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.3.0"
 RANK_JUMP_THRESHOLD = 20
 
 
@@ -202,16 +202,16 @@ with right:
         st.rerun()
 
 try:
-    history_df = load_naver_food_history()
+    meta_df = load_naver_food_meta()
 except Exception as exc:
-    st.error("Google Sheets의 NAVER 식품 검색어 데이터를 불러오지 못했습니다.")
+    st.error("Google Sheets의 NAVER META 데이터를 불러오지 못했습니다.")
     st.exception(exc)
     st.stop()
 
-scope_options = available_scopes(history_df)
+scope_options = available_scopes(meta_df)
 
 if not scope_options:
-    st.warning("NAVER_FOOD_KEYWORD_RAW에 조회 가능한 분류 데이터가 없습니다.")
+    st.warning("NAVER_META에 조회 가능한 분류 데이터가 없습니다.")
     st.stop()
 
 scope_name_to_key = {
@@ -247,13 +247,9 @@ with st.container(border=True):
         selected_scope_name
     ]
 
-    scoped_history_df = filter_scope(
-        history_df,
-        selected_scope_key,
-    )
-
     dates = available_dates(
-        scoped_history_df
+        meta_df,
+        selected_scope_key,
     )
 
     if not dates:
@@ -291,8 +287,17 @@ if analysis_date not in dates:
     )
     st.stop()
 
-# 이후 모든 분석은 선택한 분류로 필터된 데이터만 사용
-history_df = scoped_history_df
+# 실제 대용량 검색어 데이터는 분석일이 정해진 뒤 필요한 범위만 조회한다.
+try:
+    history_df = load_naver_food_analysis_history(
+        scope_key=selected_scope_key,
+        analysis_date=analysis_date,
+        history_days=30,
+    )
+except Exception as exc:
+    st.error("선택한 분석기간의 NAVER 검색어 데이터를 불러오지 못했습니다.")
+    st.exception(exc)
+    st.stop()
 
 current = snapshot(history_df, analysis_date)
 prev_day_date = analysis_date - timedelta(days=1)

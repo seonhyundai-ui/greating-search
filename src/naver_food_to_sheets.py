@@ -2,67 +2,34 @@ from __future__ import annotations
 
 import argparse
 import logging
+import random
 import sys
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 from src.google_sheets_auth import get_sheets_credentials
 from src.naver_food_rank import fetch_food_keyword_rank
+from src.naver_monthly_store import (
+    DATA_HEADERS,
+    META_HEADERS,
+    META_SHEET,
+    SCOPES,
+    SCOPE_ORDER,
+    monthly_sheet_name,
+)
 from src.naver_spreadsheet_config import (
     configured_years,
     get_spreadsheet_id,
     get_spreadsheet_ids,
 )
 
-APP_VERSION = "0.5.0"
-
-SHEET_NAME = "NAVER_FOOD_KEYWORD_RAW"
+APP_VERSION = "0.7.0"
 TIMEZONE = ZoneInfo("Asia/Seoul")
-
-# 기존 6개 컬럼은 그대로 유지하고 G/H만 추가한다.
-# 따라서 기존 2025/2026 식품 전체 데이터 마이그레이션이 필요 없다.
-HEADERS = [
-    "snapshot_date",
-    "rank",
-    "keyword",
-    "category_id",
-    "category_name",
-    "collected_at",
-    "scope_key",
-    "scope_name",
-]
-
-SCOPES = [
-    {
-        "scope_key": "FOOD_ALL",
-        "scope_name": "식품 전체",
-        "category_id": "50000006",
-        "category_name": "식품",
-    },
-    {
-        "scope_key": "FROZEN_CONVENIENCE",
-        "scope_name": "냉동/간편조리식품",
-        "category_id": "50000026",
-        "category_name": "냉동/간편조리식품",
-    },
-    {
-        "scope_key": "MEALKIT",
-        "scope_name": "밀키트",
-        "category_id": "50014240",
-        "category_name": "밀키트",
-    },
-    {
-        "scope_key": "INSTANT_RICE_SOUP",
-        "scope_name": "즉석밥/즉석국",
-        "category_id": "50020779",
-        "category_name": "즉석밥/즉석국",
-    },
-]
-
-SCOPE_KEYS = {scope["scope_key"] for scope in SCOPES}
 
 LOG_DIR = Path("logs")
 LOG_FILE = LOG_DIR / "naver_food_daily.log"
@@ -107,24 +74,62 @@ def _yesterday_kst():
 
 def _date_range(start_date, end_date):
     current = start_date
-
     while current <= end_date:
         yield current
         current += timedelta(days=1)
 
 
-def _get_sheets_service():
-    creds = get_sheets_credentials()
+def _service():
     return build(
         "sheets",
         "v4",
-        credentials=creds,
+        credentials=get_sheets_credentials(),
         cache_discovery=False,
     )
 
 
-def _get_sheet_properties(service, spreadsheet_id: str):
-    spreadsheet = (
+def _execute_with_retry(
+    request,
+    *,
+    label: str,
+    max_attempts: int = 6,
+):
+    """
+    일시적 429/5xx 오류 재시도.
+    같은 range에 values.update 하는 DATA 쓰기에 사용한다.
+    """
+    retry_statuses = {429, 500, 502, 503, 504}
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return request.execute()
+        except HttpError as exc:
+            status = getattr(exc.resp, "status", None)
+
+            if status not in retry_statuses or attempt >= max_attempts:
+                raise
+
+            wait_seconds = min(
+                30.0,
+                (2 ** (attempt - 1)) + random.uniform(0.2, 1.0),
+            )
+
+            LOGGER.warning(
+                "[RETRY] %s | HTTP %s | %s/%s | %.1f초 후 재시도",
+                label,
+                status,
+                attempt,
+                max_attempts,
+                wait_seconds,
+            )
+            time.sleep(wait_seconds)
+
+
+def _sheet_properties(
+    service,
+    spreadsheet_id: str,
+) -> dict[str, dict]:
+    result = (
         service.spreadsheets()
         .get(
             spreadsheetId=spreadsheet_id,
@@ -137,17 +142,22 @@ def _get_sheet_properties(service, spreadsheet_id: str):
         .execute()
     )
 
-    for sheet in spreadsheet.get("sheets", []):
-        props = sheet.get("properties", {})
-
-        if props.get("title") == SHEET_NAME:
-            return props
-
-    return None
+    return {
+        sheet["properties"]["title"]: sheet["properties"]
+        for sheet in result.get("sheets", [])
+    }
 
 
-def _ensure_sheet(service, spreadsheet_id: str) -> int:
-    props = _get_sheet_properties(service, spreadsheet_id)
+def _ensure_sheet(
+    service,
+    spreadsheet_id: str,
+    title: str,
+    columns: int,
+) -> int:
+    props = _sheet_properties(
+        service,
+        spreadsheet_id,
+    ).get(title)
 
     if props is None:
         response = (
@@ -159,10 +169,10 @@ def _ensure_sheet(service, spreadsheet_id: str) -> int:
                         {
                             "addSheet": {
                                 "properties": {
-                                    "title": SHEET_NAME,
+                                    "title": title,
                                     "gridProperties": {
                                         "rowCount": 1000,
-                                        "columnCount": len(HEADERS),
+                                        "columnCount": columns,
                                         "frozenRowCount": 1,
                                     },
                                 }
@@ -174,64 +184,61 @@ def _ensure_sheet(service, spreadsheet_id: str) -> int:
             .execute()
         )
 
-        props = response["replies"][0]["addSheet"]["properties"]
-        LOGGER.info("[SHEETS] created sheet: %s", SHEET_NAME)
-
-    sheet_id = props["sheetId"]
-    column_count = int(
-        props.get("gridProperties", {}).get("columnCount", 0)
-    )
-
-    if column_count < len(HEADERS):
-        (
-            service.spreadsheets()
-            .batchUpdate(
-                spreadsheetId=spreadsheet_id,
-                body={
-                    "requests": [
-                        {
-                            "appendDimension": {
-                                "sheetId": sheet_id,
-                                "dimension": "COLUMNS",
-                                "length": len(HEADERS) - column_count,
-                            }
-                        }
-                    ]
-                },
-            )
-            .execute()
-        )
-        LOGGER.info(
-            "[SHEETS] columns expanded: %s -> %s",
-            column_count,
-            len(HEADERS),
+        sheet_id = int(
+            response["replies"][0]["addSheet"]["properties"]["sheetId"]
         )
 
-    header_result = (
-        service.spreadsheets()
-        .values()
-        .get(
-            spreadsheetId=spreadsheet_id,
-            range=f"'{SHEET_NAME}'!A1:H1",
-        )
-        .execute()
-    )
-
-    current = header_result.get("values", [])
-
-    if not current or current[0] != HEADERS:
         (
             service.spreadsheets()
             .values()
             .update(
                 spreadsheetId=spreadsheet_id,
-                range=f"'{SHEET_NAME}'!A1:H1",
+                range=f"'{title}'!A1",
                 valueInputOption="RAW",
-                body={"values": [HEADERS]},
+                body={
+                    "values": [
+                        META_HEADERS
+                        if title == META_SHEET
+                        else DATA_HEADERS
+                    ]
+                },
             )
             .execute()
         )
-        LOGGER.info("[SHEETS] header created/updated to 8 columns")
+
+        LOGGER.info("[SHEETS] created: %s", title)
+        return sheet_id
+
+    return int(props["sheetId"])
+
+
+def _ensure_row_capacity(
+    service,
+    spreadsheet_id: str,
+    title: str,
+    required_rows: int,
+) -> None:
+    """
+    values.update() 전에 필요한 grid row 수를 확보한다.
+    월별 TOP500 누적 탭은 한 달 최대 약 15,500행이므로 필수다.
+    """
+    props = _sheet_properties(
+        service,
+        spreadsheet_id,
+    ).get(title)
+
+    if props is None:
+        raise RuntimeError(
+            f"시트가 없습니다: {title}"
+        )
+
+    sheet_id = int(props["sheetId"])
+    current_rows = int(
+        props.get("gridProperties", {}).get("rowCount", 0)
+    )
+
+    if current_rows >= required_rows:
+        return
 
     (
         service.spreadsheets()
@@ -240,213 +247,276 @@ def _ensure_sheet(service, spreadsheet_id: str) -> int:
             body={
                 "requests": [
                     {
-                        "updateSheetProperties": {
-                            "properties": {
-                                "sheetId": sheet_id,
-                                "gridProperties": {
-                                    "frozenRowCount": 1
-                                },
-                            },
-                            "fields": "gridProperties.frozenRowCount",
+                        "appendDimension": {
+                            "sheetId": sheet_id,
+                            "dimension": "ROWS",
+                            "length": required_rows - current_rows,
                         }
-                    },
-                    {
-                        "repeatCell": {
-                            "range": {
-                                "sheetId": sheet_id,
-                                "startRowIndex": 0,
-                                "endRowIndex": 1,
-                                "startColumnIndex": 0,
-                                "endColumnIndex": len(HEADERS),
-                            },
-                            "cell": {
-                                "userEnteredFormat": {
-                                    "textFormat": {
-                                        "bold": True
-                                    }
-                                }
-                            },
-                            "fields": (
-                                "userEnteredFormat."
-                                "textFormat.bold"
-                            ),
-                        }
-                    },
+                    }
                 ]
             },
         )
         .execute()
     )
 
-    return sheet_id
 
-
-def _read_snapshot_scope_rows(
+def _read_meta(
     service,
     spreadsheet_id: str,
-):
-    try:
-        result = (
-            service.spreadsheets()
-            .values()
-            .get(
-                spreadsheetId=spreadsheet_id,
-                range=f"'{SHEET_NAME}'!A2:H",
-            )
-            .execute()
-        )
-    except Exception:
-        return []
-
-    values = result.get("values", [])
-    parsed = []
-
-    for idx, row in enumerate(values, start=2):
-        padded = list(row) + [""] * (8 - len(row))
-        snapshot_date = str(padded[0]).strip()
-
-        try:
-            _parse_date(snapshot_date)
-        except ValueError:
-            continue
-
-        category_id = str(padded[3]).strip()
-        scope_key = str(padded[6]).strip()
-
-        # 기존 6컬럼 데이터는 모두 '식품 전체'로 간주.
-        if not scope_key:
-            if category_id == "50000006":
-                scope_key = "FOOD_ALL"
-            else:
-                scope_key = f"LEGACY_{category_id or 'UNKNOWN'}"
-
-        parsed.append(
-            {
-                "row_number": idx,
-                "snapshot_date": snapshot_date,
-                "scope_key": scope_key,
-            }
-        )
-
-    return parsed
-
-
-def _get_latest_snapshot_date(service):
-    latest = None
-
-    for year, spreadsheet_id in get_spreadsheet_ids().items():
-        rows = _read_snapshot_scope_rows(
-            service,
-            spreadsheet_id,
-        )
-
-        if not rows:
-            continue
-
-        year_latest = max(
-            _parse_date(row["snapshot_date"])
-            for row in rows
-        )
-
-        if latest is None or year_latest > latest:
-            latest = year_latest
-
-    return latest
-
-
-def _existing_scope_rows(
-    service,
-    spreadsheet_id: str,
-    target_date: str,
-    scope_key: str,
-) -> list[int]:
-    rows = _read_snapshot_scope_rows(
+) -> list[dict]:
+    props = _sheet_properties(
         service,
         spreadsheet_id,
     )
 
-    return [
-        row["row_number"]
-        for row in rows
+    if META_SHEET not in props:
+        return []
+
+    values = (
+        service.spreadsheets()
+        .values()
+        .get(
+            spreadsheetId=spreadsheet_id,
+            range=f"'{META_SHEET}'!A2:J",
+        )
+        .execute()
+        .get("values", [])
+    )
+
+    result = []
+
+    for row_number, raw in enumerate(values, start=2):
+        row = list(raw) + [""] * (10 - len(raw))
+
+        if not str(row[0]).strip():
+            continue
+
+        result.append(
+            {
+                "_row_number": row_number,
+                "snapshot_date": str(row[0]).strip(),
+                "scope_key": str(row[1]).strip(),
+                "scope_name": str(row[2]).strip(),
+                "sheet_name": str(row[3]).strip(),
+                "row_start": str(row[4]).strip(),
+                "row_end": str(row[5]).strip(),
+                "row_count": str(row[6]).strip(),
+                "status": str(row[7]).strip(),
+                "category_id": str(row[8]).strip(),
+                "updated_at": str(row[9]).strip(),
+            }
+        )
+
+    return result
+
+
+def _find_meta(
+    meta_rows: list[dict],
+    target_date: str,
+    scope_key: str,
+) -> dict | None:
+    for row in meta_rows:
         if (
             row["snapshot_date"] == target_date
             and row["scope_key"] == scope_key
-        )
+        ):
+            return row
+    return None
+
+
+def _meta_row_values(record: dict) -> list:
+    return [
+        record["snapshot_date"],
+        record["scope_key"],
+        record["scope_name"],
+        record["sheet_name"],
+        record["row_start"],
+        record["row_end"],
+        record["row_count"],
+        record["status"],
+        record["category_id"],
+        record["updated_at"],
     ]
 
 
-def _scope_keys_for_date(
+def _upsert_meta(
     service,
     spreadsheet_id: str,
-    target_date: str,
-) -> set[str]:
-    rows = _read_snapshot_scope_rows(
+    meta_rows: list[dict],
+    record: dict,
+) -> None:
+    _ensure_sheet(
         service,
         spreadsheet_id,
+        META_SHEET,
+        columns=len(META_HEADERS),
     )
 
-    return {
-        row["scope_key"]
-        for row in rows
-        if row["snapshot_date"] == target_date
-    }
+    existing = _find_meta(
+        meta_rows,
+        record["snapshot_date"],
+        record["scope_key"],
+    )
 
+    if existing:
+        row_number = existing["_row_number"]
 
-def _delete_rows(
-    service,
-    spreadsheet_id: str,
-    sheet_id: int,
-    row_numbers: list[int],
-) -> None:
-    if not row_numbers:
+        _ensure_row_capacity(
+            service,
+            spreadsheet_id,
+            META_SHEET,
+            required_rows=max(2, int(row_number)),
+        )
+
+        (
+            service.spreadsheets()
+            .values()
+            .update(
+                spreadsheetId=spreadsheet_id,
+                range=f"'{META_SHEET}'!A{row_number}:J{row_number}",
+                valueInputOption="RAW",
+                body={"values": [_meta_row_values(record)]},
+            )
+            .execute()
+        )
+
+        existing.update(record)
         return
 
-    blocks: list[tuple[int, int]] = []
-    start = prev = row_numbers[0]
+    # append 직전 현재 META 행 수 + 1행을 확보한다.
+    meta_props = _sheet_properties(
+        service,
+        spreadsheet_id,
+    )[META_SHEET]
+    current_meta_rows = int(
+        meta_props.get("gridProperties", {}).get("rowCount", 0)
+    )
+    next_meta_row = max(
+        2,
+        len(meta_rows) + 2,
+    )
 
-    for row_num in row_numbers[1:]:
-        if row_num == prev + 1:
-            prev = row_num
-            continue
-
-        blocks.append((start, prev))
-        start = prev = row_num
-
-    blocks.append((start, prev))
-
-    requests = []
-
-    for start_row, end_row in reversed(blocks):
-        requests.append(
-            {
-                "deleteDimension": {
-                    "range": {
-                        "sheetId": sheet_id,
-                        "dimension": "ROWS",
-                        "startIndex": start_row - 1,
-                        "endIndex": end_row,
-                    }
-                }
-            }
+    if current_meta_rows < next_meta_row:
+        _ensure_row_capacity(
+            service,
+            spreadsheet_id,
+            META_SHEET,
+            required_rows=next_meta_row,
         )
+
+    response = (
+        service.spreadsheets()
+        .values()
+        .append(
+            spreadsheetId=spreadsheet_id,
+            range=f"'{META_SHEET}'!A:J",
+            valueInputOption="RAW",
+            insertDataOption="INSERT_ROWS",
+            body={"values": [_meta_row_values(record)]},
+        )
+        .execute()
+    )
+
+    updated_range = (
+        response.get("updates", {})
+        .get("updatedRange", "")
+    )
+
+    # updatedRange 예: NAVER_META!A15:J15
+    row_number = None
+    if "!" in updated_range:
+        tail = updated_range.split("!", 1)[1]
+        digits = "".join(
+            char
+            for char in tail.split(":")[0]
+            if char.isdigit()
+        )
+        if digits:
+            row_number = int(digits)
+
+    meta_rows.append(
+        {
+            **record,
+            "_row_number": row_number or 0,
+        }
+    )
+
+
+def _next_data_row(
+    service,
+    spreadsheet_id: str,
+    sheet_name: str,
+) -> int:
+    values = (
+        service.spreadsheets()
+        .values()
+        .get(
+            spreadsheetId=spreadsheet_id,
+            range=f"'{sheet_name}'!A:A",
+        )
+        .execute()
+        .get("values", [])
+    )
+
+    return max(2, len(values) + 1)
+
+
+def _clear_old_range_if_needed(
+    service,
+    spreadsheet_id: str,
+    existing_meta: dict | None,
+) -> None:
+    if not existing_meta:
+        return
+
+    if existing_meta.get("status") != "DATA":
+        return
+
+    sheet_name = existing_meta.get("sheet_name", "")
+    row_start = existing_meta.get("row_start", "")
+    row_end = existing_meta.get("row_end", "")
+
+    if not (
+        sheet_name
+        and str(row_start).isdigit()
+        and str(row_end).isdigit()
+    ):
+        return
 
     (
         service.spreadsheets()
-        .batchUpdate(
+        .values()
+        .clear(
             spreadsheetId=spreadsheet_id,
-            body={"requests": requests},
+            range=(
+                f"'{sheet_name}'!"
+                f"A{row_start}:F{row_end}"
+            ),
+            body={},
         )
         .execute()
     )
 
 
-def _append_dataframe(
+def _append_data(
     service,
     spreadsheet_id: str,
+    sheet_name: str,
     df,
-    scope_key: str,
-    scope_name: str,
-) -> int:
+) -> tuple[int, int]:
+    _ensure_sheet(
+        service,
+        spreadsheet_id,
+        sheet_name,
+        columns=len(DATA_HEADERS),
+    )
+
+    start_row = _next_data_row(
+        service,
+        spreadsheet_id,
+        sheet_name,
+    )
+
     values = [
         [
             str(row.snapshot_date),
@@ -455,141 +525,240 @@ def _append_dataframe(
             str(row.category_id),
             str(row.category_name),
             str(row.collected_at),
-            scope_key,
-            scope_name,
         ]
         for row in df.itertuples(index=False)
     ]
 
-    response = (
+    end_row = start_row + len(values) - 1
+
+    _ensure_row_capacity(
+        service,
+        spreadsheet_id,
+        sheet_name,
+        required_rows=end_row,
+    )
+
+    request = (
         service.spreadsheets()
         .values()
-        .append(
+        .update(
             spreadsheetId=spreadsheet_id,
-            range=f"'{SHEET_NAME}'!A:H",
+            range=f"'{sheet_name}'!A{start_row}:F{end_row}",
             valueInputOption="RAW",
-            insertDataOption="INSERT_ROWS",
             body={"values": values},
         )
-        .execute()
     )
 
-    return int(
-        response.get(
-            "updates",
-            {},
-        ).get(
-            "updatedRows",
-            0,
-        )
+    _execute_with_retry(
+        request,
+        label=f"{sheet_name} A{start_row}:F{end_row}",
     )
 
+    return start_row, end_row
 
-def _collect_and_upload_scope(
+
+def _collect_scope(
     service,
     spreadsheet_id: str,
-    sheet_id: int,
+    meta_rows: list[dict],
     target_date: str,
     scope: dict,
-    replace: bool = False,
+    replace: bool,
 ) -> str:
     scope_key = scope["scope_key"]
     scope_name = scope["scope_name"]
 
-    existing_rows = _existing_scope_rows(
-        service,
-        spreadsheet_id,
+    existing = _find_meta(
+        meta_rows,
         target_date,
         scope_key,
     )
 
-    if existing_rows and not replace:
+    if existing and not replace:
         LOGGER.info(
-            "[SKIP] %s | %s already exists rows=%s",
+            "[SKIP] %s | %s | status=%s",
             target_date,
             scope_name,
-            len(existing_rows),
+            existing["status"],
         )
         return "SKIP"
 
-    LOGGER.info(
-        "[NAVER] %s | %s TOP 500 수집",
-        target_date,
-        scope_name,
-    )
-
-    df = fetch_food_keyword_rank(
-        target_date=target_date,
-        category_id=scope["category_id"],
-        category_name=scope["category_name"],
-    )
-
-    if len(df) != 500:
-        raise RuntimeError(
-            f"{target_date} / {scope_name} NAVER 응답 행수 이상: "
-            f"expected=500, got={len(df)}"
+    try:
+        df = fetch_food_keyword_rank(
+            target_date=target_date,
+            category_id=scope["category_id"],
+            category_name=scope["category_name"],
         )
+    except RuntimeError as exc:
+        if "No ranking data returned for" not in str(exc):
+            raise
 
-    if existing_rows and replace:
-        LOGGER.info(
-            "[REPLACE] %s | %s rows=%s -> delete",
-            target_date,
-            scope_name,
-            len(existing_rows),
-        )
+        target = _parse_date(target_date)
 
-        _delete_rows(
+        # D-1 데이터는 NAVER가 아직 게시하지 않았을 수 있다.
+        # 이때 NO_DATA marker를 남기면 이후 자동 수집이 영원히 SKIP될 수 있으므로
+        # META에 기록하지 않고 WAIT로 종료한다.
+        if target >= _yesterday_kst():
+            LOGGER.warning(
+                "[WAIT] %s | %s | NAVER 데이터가 아직 게시되지 않음",
+                target_date,
+                scope_name,
+            )
+            return "WAIT"
+
+        # 과거 날짜는 실제로 해당 분류 데이터가 없을 수 있으므로
+        # NO_DATA marker를 기록하여 반복 조회를 방지한다.
+        if replace:
+            _clear_old_range_if_needed(
+                service,
+                spreadsheet_id,
+                existing,
+            )
+
+        record = {
+            "snapshot_date": target_date,
+            "scope_key": scope_key,
+            "scope_name": scope_name,
+            "sheet_name": monthly_sheet_name(
+                scope_key,
+                target,
+            ),
+            "row_start": "",
+            "row_end": "",
+            "row_count": 0,
+            "status": "NO_DATA",
+            "category_id": scope["category_id"],
+            "updated_at": datetime.now().strftime(
+                "%Y-%m-%d %H:%M:%S"
+            ),
+        }
+
+        _upsert_meta(
             service,
             spreadsheet_id,
-            sheet_id,
-            existing_rows,
+            meta_rows,
+            record,
         )
 
-    updated_rows = _append_dataframe(
+        LOGGER.warning(
+            "[NO DATA] %s | %s -> META only",
+            target_date,
+            scope_name,
+        )
+        return "NO_DATA"
+
+    row_count = len(df)
+
+    # NAVER DataLab의 과거 카테고리는 특정 날짜에
+    # 실제 제공 랭킹이 500개 미만일 수 있다.
+    # 1~500행은 정상 데이터로 저장하고, 500행 미만은 경고만 남긴다.
+    if row_count <= 0:
+        raise RuntimeError(
+            f"{target_date} / {scope_name} "
+            "ranking data is empty"
+        )
+
+    if row_count > 500:
+        raise RuntimeError(
+            f"{target_date} / {scope_name} "
+            f"unexpected ranking rows: {row_count} (>500)"
+        )
+
+    if row_count < 500:
+        LOGGER.warning(
+            "[PARTIAL DATA] %s | %s | rows=%s/500 "
+            "| NAVER 제공 랭킹 수만 저장",
+            target_date,
+            scope_name,
+            row_count,
+        )
+
+    if replace:
+        _clear_old_range_if_needed(
+            service,
+            spreadsheet_id,
+            existing,
+        )
+
+    target = _parse_date(target_date)
+    sheet_name = monthly_sheet_name(
+        scope_key,
+        target,
+    )
+
+    start_row, end_row = _append_data(
         service,
         spreadsheet_id,
+        sheet_name,
         df,
-        scope_key,
-        scope_name,
     )
 
-    if updated_rows != len(df):
-        raise RuntimeError(
-            f"{target_date} / {scope_name} Google Sheets 적재 행수 불일치: "
-            f"expected={len(df)}, updated={updated_rows}"
-        )
+    record = {
+        "snapshot_date": target_date,
+        "scope_key": scope_key,
+        "scope_name": scope_name,
+        "sheet_name": sheet_name,
+        "row_start": start_row,
+        "row_end": end_row,
+        "row_count": len(df),
+        "status": "DATA",
+        "category_id": scope["category_id"],
+        "updated_at": datetime.now().strftime(
+            "%Y-%m-%d %H:%M:%S"
+        ),
+    }
+
+    _upsert_meta(
+        service,
+        spreadsheet_id,
+        meta_rows,
+        record,
+    )
 
     LOGGER.info(
-        "[SUCCESS] %s | %s rows=%s",
+        "[SUCCESS] %s | %s | %s!%s:%s",
         target_date,
         scope_name,
-        updated_rows,
+        sheet_name,
+        start_row,
+        end_row,
     )
+
     return "SUCCESS"
 
 
-def _collect_and_upload_date(
+def _collect_date(
     service,
     target_date: str,
     replace: bool = False,
 ) -> dict[str, int]:
     target = _parse_date(target_date)
     spreadsheet_id = get_spreadsheet_id(target.year)
-    sheet_id = _ensure_sheet(
+
+    _ensure_sheet(
+        service,
+        spreadsheet_id,
+        META_SHEET,
+        columns=len(META_HEADERS),
+    )
+
+    meta_rows = _read_meta(
         service,
         spreadsheet_id,
     )
+
+    stats = {
+        "SUCCESS": 0,
+        "SKIP": 0,
+        "NO_DATA": 0,
+        "WAIT": 0,
+    }
 
     LOGGER.info(
         "[TARGET] %s -> NAVER_SEARCH_%s",
         target_date,
         target.year,
     )
-
-    stats = {
-        "SUCCESS": 0,
-        "SKIP": 0,
-    }
 
     for index, scope in enumerate(SCOPES, start=1):
         LOGGER.info(
@@ -599,10 +768,10 @@ def _collect_and_upload_date(
             scope["scope_name"],
         )
 
-        result = _collect_and_upload_scope(
+        result = _collect_scope(
             service=service,
             spreadsheet_id=spreadsheet_id,
-            sheet_id=sheet_id,
+            meta_rows=meta_rows,
             target_date=target_date,
             scope=scope,
             replace=replace,
@@ -613,67 +782,83 @@ def _collect_and_upload_date(
     return stats
 
 
-def _latest_date_needs_scope_backfill(
+def _all_meta_rows(service) -> list[dict]:
+    rows = []
+
+    for year, spreadsheet_id in get_spreadsheet_ids().items():
+        try:
+            year_rows = _read_meta(
+                service,
+                spreadsheet_id,
+            )
+        except Exception:
+            continue
+
+        for row in year_rows:
+            row["_year"] = year
+            rows.append(row)
+
+    return rows
+
+
+def _latest_complete_date(
     service,
-    latest_date,
-) -> bool:
-    if latest_date is None:
-        return False
+):
+    meta_rows = _all_meta_rows(service)
 
-    spreadsheet_id = get_spreadsheet_id(
-        latest_date.year
-    )
+    if not meta_rows:
+        return None
 
-    existing = _scope_keys_for_date(
-        service,
-        spreadsheet_id,
-        latest_date.isoformat(),
-    )
+    by_date: dict[str, set[str]] = {}
 
-    return not SCOPE_KEYS.issubset(existing)
+    for row in meta_rows:
+        by_date.setdefault(
+            row["snapshot_date"],
+            set(),
+        ).add(row["scope_key"])
+
+    required = set(SCOPE_ORDER)
+    complete_dates = [
+        _parse_date(date_str)
+        for date_str, scopes in by_date.items()
+        if required.issubset(scopes)
+    ]
+
+    if complete_dates:
+        return max(complete_dates)
+
+    # 아직 완전한 날짜가 하나도 없으면 가장 최신 존재 날짜부터 보충.
+    return max(
+        _parse_date(row["snapshot_date"])
+        for row in meta_rows
+    ) - timedelta(days=1)
 
 
-def run_catchup() -> None:
-    service = _get_sheets_service()
-
-    latest_date = _get_latest_snapshot_date(service)
+def run_catchup() -> dict:
+    service = _service()
+    latest_complete = _latest_complete_date(service)
     end_date = _yesterday_kst()
 
-    if latest_date is None:
+    if latest_complete is None:
         start_date = end_date
-        LOGGER.info(
-            "[AUTO] 저장된 날짜 없음 -> D-1(%s) 1일만 최초 적재",
-            end_date.isoformat(),
-        )
     else:
-        # 기존 최신 날짜가 FOOD_ALL만 있는 경우,
-        # 그 날짜부터 다시 시작해 누락된 3개 세부 분류를 채운다.
-        if _latest_date_needs_scope_backfill(
-            service,
-            latest_date,
-        ):
-            start_date = latest_date
-            LOGGER.info(
-                "[AUTO] latest=%s has missing scopes -> "
-                "same date부터 세부분류 보충",
-                latest_date.isoformat(),
-            )
-        else:
-            start_date = latest_date + timedelta(days=1)
-            LOGGER.info(
-                "[AUTO] latest=%s complete | catch-up=%s ~ %s",
-                latest_date.isoformat(),
-                start_date.isoformat(),
-                end_date.isoformat(),
-            )
+        start_date = latest_complete + timedelta(days=1)
 
     if start_date > end_date:
         LOGGER.info(
-            "[UP-TO-DATE] latest=%s | D-1=%s | 추가 적재 없음",
-            latest_date.isoformat() if latest_date else "-",
-            end_date.isoformat(),
+            "[UP-TO-DATE] latest_complete=%s | D-1=%s",
+            latest_complete,
+            end_date,
         )
-        return
+        return {
+            "status": "UP_TO_DATE",
+            "latest_complete": (
+                latest_complete.isoformat()
+                if latest_complete
+                else None
+            ),
+            "target_date": end_date.isoformat(),
+        }
 
     targets = list(
         _date_range(
@@ -683,86 +868,89 @@ def run_catchup() -> None:
     )
 
     LOGGER.info(
-        "[CATCH-UP] %s일 적재 예정: %s",
+        "[CATCH-UP] %s ~ %s | %s일",
+        start_date,
+        end_date,
         len(targets),
-        ", ".join(
-            date.isoformat()
-            for date in targets
-        ),
     )
-
-    completed_dates = 0
 
     for index, target in enumerate(targets, start=1):
         target_str = target.isoformat()
 
         LOGGER.info(
-            "[DATE %s/%s] %s 시작",
+            "[DATE %s/%s] %s",
             index,
             len(targets),
             target_str,
         )
 
-        try:
-            stats = _collect_and_upload_date(
-                service=service,
-                target_date=target_str,
-                replace=False,
-            )
-        except RuntimeError as exc:
-            if "No ranking data returned for" in str(exc):
-                LOGGER.warning(
-                    "[WAIT] 네이버 데이터랩이 아직 업데이트되지 않았습니다. "
-                    "target_date=%s",
-                    target_str,
-                )
-                LOGGER.info(
-                    "[CATCH-UP STOP] %s 이후 데이터는 "
-                    "다음 실행에서 다시 확인합니다.",
-                    target_str,
-                )
-                return
-            raise
+        stats = _collect_date(
+            service,
+            target_str,
+            replace=False,
+        )
 
         LOGGER.info(
-            "[DATE COMPLETE] %s | success_scopes=%s | skip_scopes=%s",
+            "[DATE COMPLETE] %s | success=%s skip=%s no_data=%s wait=%s",
             target_str,
             stats["SUCCESS"],
             stats["SKIP"],
+            stats["NO_DATA"],
+            stats["WAIT"],
         )
-        completed_dates += 1
 
-    LOGGER.info(
-        "[CATCH-UP COMPLETE] dates=%s",
-        completed_dates,
-    )
+        if stats["WAIT"] > 0:
+            LOGGER.warning(
+                "[CATCH-UP WAIT] %s | NAVER 최신 데이터 게시 대기",
+                target_str,
+            )
+            return {
+                "status": "WAIT",
+                "target_date": target_str,
+                **stats,
+            }
+
+    return {
+        "status": "SUCCESS",
+        "target_date": end_date.isoformat(),
+    }
 
 
 def run_manual(
     target_date: str,
     replace: bool = False,
-) -> None:
+) -> dict:
     _parse_date(target_date)
-    service = _get_sheets_service()
 
-    LOGGER.info(
-        "[MANUAL] target=%s | replace=%s",
+    stats = _collect_date(
+        _service(),
         target_date,
-        replace,
-    )
-
-    _collect_and_upload_date(
-        service=service,
-        target_date=target_date,
         replace=replace,
     )
+
+    LOGGER.info(
+        "[MANUAL COMPLETE] %s | success=%s skip=%s no_data=%s wait=%s",
+        target_date,
+        stats["SUCCESS"],
+        stats["SKIP"],
+        stats["NO_DATA"],
+        stats["WAIT"],
+    )
+
+    status = "WAIT" if stats["WAIT"] > 0 else "SUCCESS"
+
+    return {
+        "status": status,
+        "target_date": target_date,
+        **stats,
+    }
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "NAVER 식품 전체 + 3개 세부분류 TOP500 -> 연도별 Google Sheets 누적. "
-            "날짜 생략 시 최신 날짜의 누락 분류를 보충한 뒤 D-1까지 자동 적재."
+            "NAVER 식품 4개 분류 TOP500 -> "
+            "연도별 Spreadsheet / 월×분류 탭 적재"
         )
     )
 
@@ -770,20 +958,20 @@ def main() -> None:
         "target_date",
         nargs="?",
         default=None,
-        help="수동 적재 날짜 YYYY-MM-DD. 생략하면 자동 catch-up",
+        help="YYYY-MM-DD. 생략하면 META 기준 D-1까지 catch-up",
     )
 
     parser.add_argument(
         "--replace",
         action="store_true",
-        help="수동 날짜의 4개 분류를 모두 삭제 후 재적재",
+        help="지정 날짜의 기존 범위를 clear 후 재적재",
     )
 
     args = parser.parse_args()
 
-    LOGGER.info("=" * 72)
+    LOGGER.info("=" * 78)
     LOGGER.info(
-        "NAVER Food Scope Pipeline v%s",
+        "NAVER Monthly Scope Pipeline v%s",
         APP_VERSION,
     )
     LOGGER.info(
@@ -791,29 +979,28 @@ def main() -> None:
         configured_years(),
     )
     LOGGER.info(
-        "Scopes           : %s",
-        [scope["scope_name"] for scope in SCOPES],
+        "Storage          : yearly spreadsheet / monthly scope tabs",
     )
-    LOGGER.info(
-        "Sheet            : %s",
-        SHEET_NAME,
-    )
-    LOGGER.info("=" * 72)
+    LOGGER.info("=" * 78)
 
     try:
         if args.target_date:
             run_manual(
-                target_date=args.target_date,
+                args.target_date,
                 replace=args.replace,
             )
         else:
             if args.replace:
                 raise ValueError(
-                    "--replace는 target_date를 지정한 수동 실행에서만 사용할 수 있습니다."
+                    "--replace는 날짜를 지정한 경우에만 사용할 수 있습니다."
                 )
+            result = run_catchup()
 
-            run_catchup()
-
+            if result.get("status") == "WAIT":
+                raise RuntimeError(
+                    f"NAVER 최신 데이터가 아직 게시되지 않았습니다: "
+                    f"{result.get('target_date')}"
+                )
     except Exception:
         LOGGER.exception("[FAILED]")
         raise

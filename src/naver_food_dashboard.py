@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -7,24 +8,17 @@ import streamlit as st
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 
+from src.naver_monthly_store import (
+    DATA_HEADERS,
+    META_HEADERS,
+    META_SHEET,
+    SCOPE_NAMES,
+    SCOPE_ORDER,
+)
 from src.naver_spreadsheet_config import get_spreadsheet_ids
 
-SHEET_NAME = "NAVER_FOOD_KEYWORD_RAW"
+APP_VERSION = "0.4.0"
 LOCAL_TOKEN_FILE = Path("token_sheets.json")
-
-SCOPE_ORDER = [
-    "FOOD_ALL",
-    "FROZEN_CONVENIENCE",
-    "MEALKIT",
-    "INSTANT_RICE_SOUP",
-]
-
-SCOPE_NAMES = {
-    "FOOD_ALL": "식품 전체",
-    "FROZEN_CONVENIENCE": "냉동/간편조리식품",
-    "MEALKIT": "밀키트",
-    "INSTANT_RICE_SOUP": "즉석밥/즉석국",
-}
 
 
 def _cloud_credentials() -> Credentials | None:
@@ -76,158 +70,362 @@ def get_sheets_read_credentials() -> Credentials:
     )
 
 
-def _empty_frame() -> pd.DataFrame:
-    return pd.DataFrame(
-        columns=[
-            "snapshot_date",
-            "rank",
-            "keyword",
-            "category_id",
-            "category_name",
-            "collected_at",
-            "scope_key",
-            "scope_name",
-        ]
+def _service():
+    return build(
+        "sheets",
+        "v4",
+        credentials=get_sheets_read_credentials(),
+        cache_discovery=False,
     )
 
 
-def _load_one_spreadsheet(
+def _sheet_titles(
     service,
-    year: int,
     spreadsheet_id: str,
-) -> pd.DataFrame:
-    try:
-        metadata = (
-            service.spreadsheets()
-            .get(
-                spreadsheetId=spreadsheet_id,
-                fields="sheets.properties(title)",
-            )
-            .execute()
+) -> set[str]:
+    result = (
+        service.spreadsheets()
+        .get(
+            spreadsheetId=spreadsheet_id,
+            fields="sheets.properties(title)",
         )
-    except Exception as exc:
-        raise RuntimeError(
-            f"NAVER_SEARCH_{year} Spreadsheet에 접근하지 못했습니다. "
-            "Spreadsheet ID 또는 Google 계정 권한을 확인하세요."
-        ) from exc
+        .execute()
+    )
 
-    sheet_titles = {
-        sheet.get("properties", {}).get(
-            "title",
-            "",
-        )
-        for sheet in metadata.get(
-            "sheets",
-            [],
-        )
+    return {
+        sheet.get("properties", {}).get("title", "")
+        for sheet in result.get("sheets", [])
     }
-
-    if SHEET_NAME not in sheet_titles:
-        return _empty_frame()
-
-    try:
-        result = (
-            service.spreadsheets()
-            .values()
-            .get(
-                spreadsheetId=spreadsheet_id,
-                range=f"'{SHEET_NAME}'!A:H",
-            )
-            .execute()
-        )
-    except Exception as exc:
-        raise RuntimeError(
-            f"NAVER_SEARCH_{year}의 {SHEET_NAME}을 읽지 못했습니다."
-        ) from exc
-
-    values = result.get("values", [])
-
-    if len(values) <= 1:
-        return _empty_frame()
-
-    header = list(values[0])
-    rows = values[1:]
-
-    # 기존 A:F 6컬럼 시트도 읽을 수 있게 G/H 헤더를 가상 추가한다.
-    expected = [
-        "snapshot_date",
-        "rank",
-        "keyword",
-        "category_id",
-        "category_name",
-        "collected_at",
-        "scope_key",
-        "scope_name",
-    ]
-
-    width = max(
-        len(header),
-        len(expected),
-    )
-
-    if len(header) < len(expected):
-        header = header + expected[len(header):]
-
-    normalized = []
-
-    for row in rows:
-        row = list(row) + [""] * (
-            len(header) - len(row)
-        )
-        normalized.append(
-            row[:len(header)]
-        )
-
-    df = pd.DataFrame(
-        normalized,
-        columns=header,
-    )
-
-    for column in expected:
-        if column not in df.columns:
-            df[column] = ""
-
-    df = df[expected].copy()
-    df["_source_year"] = year
-
-    return df
 
 
 @st.cache_data(
     ttl=300,
     show_spinner=False,
 )
-def load_naver_food_history() -> pd.DataFrame:
-    creds = get_sheets_read_credentials()
-
-    service = build(
-        "sheets",
-        "v4",
-        credentials=creds,
-        cache_discovery=False,
-    )
-
+def load_naver_food_meta() -> pd.DataFrame:
+    """
+    대시보드 첫 로딩에서는 대용량 월별 데이터가 아니라
+    연도별 NAVER_META만 읽는다.
+    """
+    service = _service()
     mapping = get_spreadsheet_ids()
 
-    if not mapping:
-        raise RuntimeError(
-            "NAVER_SEARCH 연도별 Spreadsheet ID가 하나도 등록되지 않았습니다."
-        )
-
-    frames: list[pd.DataFrame] = []
+    frames = []
 
     for year, spreadsheet_id in mapping.items():
-        frame = _load_one_spreadsheet(
-            service,
-            year,
-            spreadsheet_id,
+        try:
+            titles = _sheet_titles(
+                service,
+                spreadsheet_id,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"NAVER_SEARCH_{year} Spreadsheet에 접근하지 못했습니다."
+            ) from exc
+
+        if META_SHEET not in titles:
+            continue
+
+        values = (
+            service.spreadsheets()
+            .values()
+            .get(
+                spreadsheetId=spreadsheet_id,
+                range=f"'{META_SHEET}'!A2:J",
+            )
+            .execute()
+            .get("values", [])
         )
 
-        if not frame.empty:
-            frames.append(frame)
+        rows = []
+
+        for raw in values:
+            row = list(raw) + [""] * (10 - len(raw))
+
+            if not str(row[0]).strip():
+                continue
+
+            rows.append(row[:10])
+
+        if not rows:
+            continue
+
+        frame = pd.DataFrame(
+            rows,
+            columns=META_HEADERS,
+        )
+        frame["_source_year"] = year
+        frame["_spreadsheet_id"] = spreadsheet_id
+        frames.append(frame)
 
     if not frames:
-        return _empty_frame()
+        return pd.DataFrame(
+            columns=META_HEADERS
+            + [
+                "_source_year",
+                "_spreadsheet_id",
+            ]
+        )
+
+    meta = pd.concat(
+        frames,
+        ignore_index=True,
+    )
+
+    meta["snapshot_date"] = pd.to_datetime(
+        meta["snapshot_date"],
+        errors="coerce",
+    ).dt.date
+
+    for column in (
+        "row_start",
+        "row_end",
+        "row_count",
+    ):
+        meta[column] = pd.to_numeric(
+            meta[column],
+            errors="coerce",
+        )
+
+    meta["scope_key"] = (
+        meta["scope_key"]
+        .astype(str)
+        .str.strip()
+    )
+
+    meta["scope_name"] = (
+        meta["scope_name"]
+        .astype(str)
+        .str.strip()
+    )
+
+    meta["status"] = (
+        meta["status"]
+        .astype(str)
+        .str.strip()
+        .str.upper()
+    )
+
+    meta = meta.dropna(
+        subset=["snapshot_date"]
+    ).copy()
+
+    return (
+        meta.sort_values(
+            [
+                "snapshot_date",
+                "scope_key",
+            ]
+        )
+        .reset_index(drop=True)
+    )
+
+
+def available_scopes(
+    meta_df: pd.DataFrame,
+) -> list[tuple[str, str]]:
+    if meta_df.empty:
+        return []
+
+    data_meta = meta_df[
+        meta_df["status"] == "DATA"
+    ]
+
+    present = set(
+        data_meta["scope_key"]
+        .dropna()
+        .tolist()
+    )
+
+    return [
+        (
+            key,
+            SCOPE_NAMES[key],
+        )
+        for key in SCOPE_ORDER
+        if key in present
+    ]
+
+
+def available_dates(
+    meta_df: pd.DataFrame,
+    scope_key: str,
+) -> list:
+    if meta_df.empty:
+        return []
+
+    subset = meta_df[
+        (meta_df["scope_key"] == scope_key)
+        & (meta_df["status"] == "DATA")
+    ]
+
+    return sorted(
+        subset["snapshot_date"]
+        .dropna()
+        .unique()
+        .tolist()
+    )
+
+
+def _previous_year_date(value):
+    try:
+        return value.replace(year=value.year - 1)
+    except ValueError:
+        return value.replace(
+            year=value.year - 1,
+            day=28,
+        )
+
+
+def _required_dates(
+    analysis_date,
+    history_days: int,
+) -> set:
+    start_date = (
+        analysis_date
+        - timedelta(days=history_days - 1)
+    )
+
+    dates = {
+        start_date + timedelta(days=offset)
+        for offset in range(history_days)
+    }
+
+    dates.add(
+        _previous_year_date(
+            analysis_date
+        )
+    )
+
+    return dates
+
+
+def _batch_get_records(
+    service,
+    spreadsheet_id: str,
+    records: list[dict],
+) -> list[pd.DataFrame]:
+    if not records:
+        return []
+
+    ranges = [
+        (
+            f"'{record['sheet_name']}'!"
+            f"A{int(record['row_start'])}:"
+            f"F{int(record['row_end'])}"
+        )
+        for record in records
+    ]
+
+    result = (
+        service.spreadsheets()
+        .values()
+        .batchGet(
+            spreadsheetId=spreadsheet_id,
+            ranges=ranges,
+        )
+        .execute()
+    )
+
+    value_ranges = result.get(
+        "valueRanges",
+        [],
+    )
+
+    frames = []
+
+    for record, value_range in zip(
+        records,
+        value_ranges,
+    ):
+        values = value_range.get(
+            "values",
+            [],
+        )
+
+        if not values:
+            continue
+
+        normalized = [
+            list(row) + [""] * (
+                len(DATA_HEADERS) - len(row)
+            )
+            for row in values
+        ]
+
+        frame = pd.DataFrame(
+            [
+                row[:len(DATA_HEADERS)]
+                for row in normalized
+            ],
+            columns=DATA_HEADERS,
+        )
+
+        frame["scope_key"] = record["scope_key"]
+        frame["scope_name"] = record["scope_name"]
+        frames.append(frame)
+
+    return frames
+
+
+@st.cache_data(
+    ttl=300,
+    show_spinner=False,
+)
+def load_naver_food_analysis_history(
+    scope_key: str,
+    analysis_date,
+    history_days: int = 30,
+) -> pd.DataFrame:
+    """
+    필요한 데이터만 읽는다.
+
+    - 분석일 포함 최근 history_days
+    - 전년도 동일일
+
+    전일/전주 비교는 recent window 안에 포함되므로 별도 추가 조회가 없다.
+    """
+    meta = load_naver_food_meta()
+
+    if meta.empty:
+        return _empty_history()
+
+    required = _required_dates(
+        analysis_date,
+        history_days,
+    )
+
+    selected = meta[
+        (meta["scope_key"] == scope_key)
+        & (meta["status"] == "DATA")
+        & (meta["snapshot_date"].isin(required))
+        & (meta["row_start"].notna())
+        & (meta["row_end"].notna())
+    ].copy()
+
+    if selected.empty:
+        return _empty_history()
+
+    service = _service()
+    frames = []
+
+    for spreadsheet_id, group in selected.groupby(
+        "_spreadsheet_id"
+    ):
+        records = group.sort_values(
+            "snapshot_date"
+        ).to_dict("records")
+
+        frames.extend(
+            _batch_get_records(
+                service,
+                spreadsheet_id,
+                records,
+            )
+        )
+
+    if not frames:
+        return _empty_history()
 
     df = pd.concat(
         frames,
@@ -250,54 +448,6 @@ def load_naver_food_history() -> pd.DataFrame:
         .str.strip()
     )
 
-    df["category_id"] = (
-        df["category_id"]
-        .astype(str)
-        .str.strip()
-    )
-
-    df["scope_key"] = (
-        df["scope_key"]
-        .fillna("")
-        .astype(str)
-        .str.strip()
-    )
-
-    df["scope_name"] = (
-        df["scope_name"]
-        .fillna("")
-        .astype(str)
-        .str.strip()
-    )
-
-    # 기존 6컬럼 데이터는 식품 전체로 간주.
-    legacy_food_mask = (
-        (df["scope_key"] == "")
-        & (df["category_id"] == "50000006")
-    )
-
-    df.loc[
-        legacy_food_mask,
-        "scope_key",
-    ] = "FOOD_ALL"
-
-    df.loc[
-        legacy_food_mask,
-        "scope_name",
-    ] = "식품 전체"
-
-    # 새 데이터인데 scope_name만 빈 경우 설정값으로 보완.
-    for key, name in SCOPE_NAMES.items():
-        mask = (
-            (df["scope_key"] == key)
-            & (df["scope_name"] == "")
-        )
-
-        df.loc[
-            mask,
-            "scope_name",
-        ] = name
-
     df = df.dropna(
         subset=[
             "snapshot_date",
@@ -314,12 +464,10 @@ def load_naver_food_history() -> pd.DataFrame:
         .astype(int)
     )
 
-    # 같은 날짜/분류/순위 중복 시 마지막 적재값 사용.
-    df = (
+    return (
         df.sort_values(
             [
                 "snapshot_date",
-                "scope_key",
                 "rank",
                 "collected_at",
             ]
@@ -335,60 +483,14 @@ def load_naver_food_history() -> pd.DataFrame:
         .reset_index(drop=True)
     )
 
-    return df
 
-
-def available_scopes(
-    df: pd.DataFrame,
-) -> list[tuple[str, str]]:
-    if df.empty:
-        return []
-
-    present = set(
-        df["scope_key"]
-        .dropna()
-        .astype(str)
-        .tolist()
-    )
-
-    result = []
-
-    for key in SCOPE_ORDER:
-        if key in present:
-            result.append(
-                (
-                    key,
-                    SCOPE_NAMES[key],
-                )
-            )
-
-    return result
-
-
-def filter_scope(
-    df: pd.DataFrame,
-    scope_key: str,
-) -> pd.DataFrame:
-    return (
-        df[
-            df["scope_key"] == scope_key
+def _empty_history() -> pd.DataFrame:
+    return pd.DataFrame(
+        columns=DATA_HEADERS
+        + [
+            "scope_key",
+            "scope_name",
         ]
-        .copy()
-        .reset_index(drop=True)
-    )
-
-
-def available_dates(
-    df: pd.DataFrame,
-) -> list:
-    if df.empty:
-        return []
-
-    return sorted(
-        df["snapshot_date"]
-        .dropna()
-        .unique()
-        .tolist()
     )
 
 
@@ -440,13 +542,10 @@ def build_top_table(
     if current.empty:
         return current
 
-    from datetime import timedelta
-
     prev_day = (
         analysis_date
         - timedelta(days=1)
     )
-
     prev_week = (
         analysis_date
         - timedelta(days=7)
@@ -456,7 +555,6 @@ def build_top_table(
         df,
         prev_day,
     )
-
     week_map = rank_map(
         df,
         prev_week,
@@ -466,7 +564,6 @@ def build_top_table(
         current["keyword"]
         .map(day_map)
     )
-
     current["전주 순위"] = (
         current["keyword"]
         .map(week_map)
@@ -475,20 +572,14 @@ def build_top_table(
     current["전일 변동"] = current.apply(
         lambda row: None
         if pd.isna(row["전일 순위"])
-        else (
-            int(row["전일 순위"])
-            - int(row["rank"])
-        ),
+        else int(row["전일 순위"]) - int(row["rank"]),
         axis=1,
     )
 
     current["전주 변동"] = current.apply(
         lambda row: None
         if pd.isna(row["전주 순위"])
-        else (
-            int(row["전주 순위"])
-            - int(row["rank"])
-        ),
+        else int(row["전주 순위"]) - int(row["rank"]),
         axis=1,
     )
 
@@ -522,13 +613,9 @@ def keyword_history(
     end_date,
     days: int = 30,
 ) -> pd.DataFrame:
-    from datetime import timedelta
-
     start_date = (
         end_date
-        - timedelta(
-            days=days - 1,
-        )
+        - timedelta(days=days - 1)
     )
 
     dates = pd.DataFrame(
@@ -543,14 +630,8 @@ def keyword_history(
 
     subset = df[
         (df["keyword"] == keyword)
-        & (
-            df["snapshot_date"]
-            >= start_date
-        )
-        & (
-            df["snapshot_date"]
-            <= end_date
-        )
+        & (df["snapshot_date"] >= start_date)
+        & (df["snapshot_date"] <= end_date)
     ][
         [
             "snapshot_date",
