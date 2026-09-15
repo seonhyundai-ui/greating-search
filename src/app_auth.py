@@ -9,7 +9,7 @@ from pathlib import Path
 import streamlit as st
 
 
-APP_AUTH_VERSION = "0.4.2"
+APP_AUTH_VERSION = "0.4.3"
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 LOGIN_LOGO_PATH = PROJECT_ROOT / "assets" / "greating_logo.png"
@@ -34,6 +34,79 @@ def _login_logo_html() -> str:
         f"<img src='data:{mime_type};base64,{encoded}' alt='GREATING logo'>"
         "</div>"
     )
+
+
+# 두벌식 한글 자판을 영문 키 입력으로 환산하기 위한 매핑
+_CHOSEONG_KEYS = [
+    "r", "R", "s", "e", "E", "f", "a", "q", "Q",
+    "t", "T", "d", "w", "W", "c", "z", "x", "v", "g",
+]
+
+_JUNGSEONG_KEYS = [
+    "k", "o", "i", "O", "j", "p", "u", "P", "h",
+    "hk", "ho", "hl", "y", "n", "nj", "np", "nl",
+    "b", "m", "ml", "l",
+]
+
+_JONGSEONG_KEYS = [
+    "",
+    "r", "R", "rt", "s", "sw", "sg", "e", "f",
+    "fr", "fa", "fq", "ft", "fx", "fv", "fg",
+    "a", "q", "qt", "t", "T", "d", "w", "c",
+    "z", "x", "v", "g",
+]
+
+_COMPAT_JAMO_KEYS = {
+    "ㄱ": "r", "ㄲ": "R", "ㄴ": "s", "ㄷ": "e", "ㄸ": "E",
+    "ㄹ": "f", "ㅁ": "a", "ㅂ": "q", "ㅃ": "Q", "ㅅ": "t",
+    "ㅆ": "T", "ㅇ": "d", "ㅈ": "w", "ㅉ": "W", "ㅊ": "c",
+    "ㅋ": "z", "ㅌ": "x", "ㅍ": "v", "ㅎ": "g",
+    "ㅏ": "k", "ㅐ": "o", "ㅑ": "i", "ㅒ": "O", "ㅓ": "j",
+    "ㅔ": "p", "ㅕ": "u", "ㅖ": "P", "ㅗ": "h", "ㅘ": "hk",
+    "ㅙ": "ho", "ㅚ": "hl", "ㅛ": "y", "ㅜ": "n", "ㅝ": "nj",
+    "ㅞ": "np", "ㅟ": "nl", "ㅠ": "b", "ㅡ": "m", "ㅢ": "ml",
+    "ㅣ": "l",
+}
+
+
+def _normalize_keyboard_password(value: str) -> str:
+    """
+    비밀번호에 한글이 포함되면 두벌식 영문 키 입력으로 환산한다.
+
+    예:
+      그리팅11!!  -> rmflxld11!!
+      rmflxld11!! -> rmflxld11!!
+
+    따라서 APP_PASSWORD가 한글/영문 어느 형태로 저장되어 있어도
+    두 입력을 동일한 비밀번호로 처리할 수 있다.
+    """
+    result: list[str] = []
+
+    for char in str(value):
+        codepoint = ord(char)
+
+        if 0xAC00 <= codepoint <= 0xD7A3:
+            syllable_index = codepoint - 0xAC00
+
+            choseong_index = syllable_index // 588
+            jungseong_index = (syllable_index % 588) // 28
+            jongseong_index = syllable_index % 28
+
+            result.append(_CHOSEONG_KEYS[choseong_index])
+            result.append(_JUNGSEONG_KEYS[jungseong_index])
+
+            if jongseong_index:
+                result.append(_JONGSEONG_KEYS[jongseong_index])
+
+            continue
+
+        if char in _COMPAT_JAMO_KEYS:
+            result.append(_COMPAT_JAMO_KEYS[char])
+            continue
+
+        result.append(char)
+
+    return "".join(result)
 
 
 def is_authenticated() -> bool:
@@ -370,11 +443,13 @@ def render_login() -> bool:
             st.error("APP_PASSWORD가 설정되지 않았습니다.")
             return False
 
-        # hmac.compare_digest()는 str 비교 시 ASCII만 지원한다.
-        # 한글/이모지/일부 특수문자가 비밀번호에 포함되어도
-        # 안전하게 비교할 수 있도록 UTF-8 bytes로 변환한다.
-        password_bytes = str(password).encode("utf-8")
-        expected_bytes = str(expected).encode("utf-8")
+        # 한/영 전환 상태가 달라도 같은 키 입력을 같은 비밀번호로 처리한다.
+        # 예: "그리팅11!!" == "rmflxld11!!"
+        normalized_password = _normalize_keyboard_password(password)
+        normalized_expected = _normalize_keyboard_password(expected)
+
+        password_bytes = normalized_password.encode("utf-8")
+        expected_bytes = normalized_expected.encode("utf-8")
 
         if hmac.compare_digest(password_bytes, expected_bytes):
             st.session_state["authenticated"] = True
