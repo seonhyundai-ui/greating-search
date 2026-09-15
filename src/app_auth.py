@@ -9,7 +9,7 @@ from pathlib import Path
 import streamlit as st
 
 
-APP_AUTH_VERSION = "0.4.1"
+APP_AUTH_VERSION = "0.4.2"
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 LOGIN_LOGO_PATH = PROJECT_ROOT / "assets" / "greating_logo.png"
@@ -370,7 +370,13 @@ def render_login() -> bool:
             st.error("APP_PASSWORD가 설정되지 않았습니다.")
             return False
 
-        if hmac.compare_digest(str(password), str(expected)):
+        # hmac.compare_digest()는 str 비교 시 ASCII만 지원한다.
+        # 한글/이모지/일부 특수문자가 비밀번호에 포함되어도
+        # 안전하게 비교할 수 있도록 UTF-8 bytes로 변환한다.
+        password_bytes = str(password).encode("utf-8")
+        expected_bytes = str(expected).encode("utf-8")
+
+        if hmac.compare_digest(password_bytes, expected_bytes):
             st.session_state["authenticated"] = True
             st.rerun()
 
