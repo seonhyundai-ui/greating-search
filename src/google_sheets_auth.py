@@ -1,30 +1,26 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
+from typing import Any
 
-# 회사 Windows 환경에서 사내 루트 인증서를 사용하는 경우를 고려
-try:
-    import truststore
-    truststore.inject_into_ssl()
-except ImportError:
-    pass
-
-from google.auth.credentials import Credentials
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials as UserCredentials
+from google.oauth2.service_account import Credentials as ServiceAccountCredentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 
-APP_VERSION = "0.2.0"
 
-SPREADSHEETS_WRITE_SCOPE = (
-    "https://www.googleapis.com/auth/spreadsheets"
-)
+AUTH_VERSION = "0.3.0"
 
-CREDENTIALS_FILE = Path("credentials.json")
-TOKEN_FILE = Path("token_sheets.json")
+ROOT = Path(__file__).resolve().parents[1]
+CREDENTIALS_FILE = ROOT / "credentials.json"
+TOKEN_FILE = ROOT / "token_sheets.json"
+SERVICE_ACCOUNT_FILE = ROOT / "service_account_greating.json"
 
-ENV_KEYS = {
+SPREADSHEETS_WRITE_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
+
+OAUTH_ENV_MAP = {
     "refresh_token": "GOOGLE_SHEETS_REFRESH_TOKEN",
     "token_uri": "GOOGLE_SHEETS_TOKEN_URI",
     "client_id": "GOOGLE_SHEETS_CLIENT_ID",
@@ -32,133 +28,273 @@ ENV_KEYS = {
 }
 
 
-def _credentials_from_mapping(
-    values: dict[str, str],
-) -> UserCredentials | None:
-    required = (
-        "refresh_token",
-        "token_uri",
-        "client_id",
-        "client_secret",
-    )
+def _normalize_service_account_info(values: dict[str, Any]) -> dict[str, Any]:
+    info = {str(k): v for k, v in dict(values).items()}
 
-    if not all(
-        str(values.get(key, "")).strip()
-        for key in required
-    ):
+    if "private_key" in info and info["private_key"] is not None:
+        private_key = str(info["private_key"])
+        if "\\n" in private_key and "\n" not in private_key:
+            private_key = private_key.replace("\\n", "\n")
+        info["private_key"] = private_key
+
+    required = [
+        "type",
+        "project_id",
+        "private_key_id",
+        "private_key",
+        "client_email",
+        "client_id",
+        "token_uri",
+    ]
+
+    missing = [key for key in required if not str(info.get(key, "")).strip()]
+    if missing:
+        raise RuntimeError(
+            "Google Service Account information is incomplete: "
+            + ", ".join(missing)
+        )
+
+    return info
+
+
+def _service_account_from_local_file():
+    if not SERVICE_ACCOUNT_FILE.exists():
         return None
 
-    creds = UserCredentials(
-        token=None,
-        refresh_token=str(values["refresh_token"]).strip(),
-        token_uri=str(values["token_uri"]).strip(),
-        client_id=str(values["client_id"]).strip(),
-        client_secret=str(values["client_secret"]).strip(),
+    return ServiceAccountCredentials.from_service_account_file(
+        SERVICE_ACCOUNT_FILE,
         scopes=[SPREADSHEETS_WRITE_SCOPE],
     )
 
-    # token=None 상태에서도 refresh_token으로 즉시 access token 발급.
+
+def _service_account_from_environment():
+    raw = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+    if not raw:
+        return None
+
+    try:
+        info = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            "GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON."
+        ) from exc
+
+    info = _normalize_service_account_info(info)
+
+    return ServiceAccountCredentials.from_service_account_info(
+        info,
+        scopes=[SPREADSHEETS_WRITE_SCOPE],
+    )
+
+
+def _service_account_from_streamlit():
+    try:
+        import streamlit as st
+    except Exception:
+        return None
+
+    try:
+        section = st.secrets.get("google_service_account")
+    except Exception:
+        return None
+
+    if not section:
+        return None
+
+    info = _normalize_service_account_info(dict(section))
+
+    return ServiceAccountCredentials.from_service_account_info(
+        info,
+        scopes=[SPREADSHEETS_WRITE_SCOPE],
+    )
+
+
+def _oauth_from_environment():
+    values = {
+        key: os.environ.get(env_name, "").strip()
+        for key, env_name in OAUTH_ENV_MAP.items()
+    }
+
+    if not any(values.values()):
+        return None
+
+    missing = [key for key, value in values.items() if not value]
+    if missing:
+        raise RuntimeError(
+            "Google Sheets OAuth environment variables are incomplete: "
+            + ", ".join(missing)
+        )
+
+    creds = UserCredentials(
+        token=None,
+        refresh_token=values["refresh_token"],
+        token_uri=values["token_uri"],
+        client_id=values["client_id"],
+        client_secret=values["client_secret"],
+        scopes=[SPREADSHEETS_WRITE_SCOPE],
+    )
     creds.refresh(Request())
     return creds
 
 
-def _credentials_from_environment() -> UserCredentials | None:
-    values = {
-        field: os.environ.get(env_name, "")
-        for field, env_name in ENV_KEYS.items()
-    }
-    return _credentials_from_mapping(values)
-
-
-def _credentials_from_streamlit() -> UserCredentials | None:
-    """
-    Streamlit Cloud:
-      [google_sheets_oauth]
-      refresh_token = "..."
-      token_uri = "..."
-      client_id = "..."
-      client_secret = "..."
-    """
+def _oauth_from_streamlit():
     try:
         import streamlit as st
-
-        if "google_sheets_oauth" not in st.secrets:
-            return None
-
-        section = st.secrets["google_sheets_oauth"]
-
-        values = {
-            "refresh_token": section.get("refresh_token", ""),
-            "token_uri": section.get("token_uri", ""),
-            "client_id": section.get("client_id", ""),
-            "client_secret": section.get("client_secret", ""),
-        }
-
-        return _credentials_from_mapping(values)
     except Exception:
         return None
 
+    try:
+        section = st.secrets.get("google_sheets_oauth")
+    except Exception:
+        return None
 
-def _credentials_from_local_token() -> UserCredentials | None:
+    if not section:
+        return None
+
+    values = {
+        "refresh_token": str(section.get("refresh_token", "")).strip(),
+        "token_uri": str(
+            section.get(
+                "token_uri",
+                "https://oauth2.googleapis.com/token",
+            )
+        ).strip(),
+        "client_id": str(section.get("client_id", "")).strip(),
+        "client_secret": str(section.get("client_secret", "")).strip(),
+    }
+
+    missing = [key for key, value in values.items() if not value]
+    if missing:
+        raise RuntimeError(
+            "Streamlit google_sheets_oauth Secrets are incomplete: "
+            + ", ".join(missing)
+        )
+
+    creds = UserCredentials(
+        token=None,
+        refresh_token=values["refresh_token"],
+        token_uri=values["token_uri"],
+        client_id=values["client_id"],
+        client_secret=values["client_secret"],
+        scopes=[SPREADSHEETS_WRITE_SCOPE],
+    )
+    creds.refresh(Request())
+    return creds
+
+
+def _oauth_from_local_token():
     if not TOKEN_FILE.exists():
         return None
 
-    creds = UserCredentials.from_authorized_user_file(
-        str(TOKEN_FILE),
-        scopes=[SPREADSHEETS_WRITE_SCOPE],
-    )
+    try:
+        creds = UserCredentials.from_authorized_user_file(
+            TOKEN_FILE,
+            [SPREADSHEETS_WRITE_SCOPE],
+        )
+    except Exception:
+        return None
 
-    if creds.expired and creds.refresh_token:
-        creds.refresh(Request())
+    if creds and not creds.has_scopes([SPREADSHEETS_WRITE_SCOPE]):
+        return None
 
-    if creds.valid:
+    if creds and creds.expired and creds.refresh_token:
+        try:
+            creds.refresh(Request())
+        except Exception:
+            return None
+
+    if creds and creds.valid:
         return creds
 
     return None
 
 
-def _run_local_oauth() -> UserCredentials:
+def _oauth_from_local_interactive():
     if not CREDENTIALS_FILE.exists():
-        raise FileNotFoundError(
-            f"{CREDENTIALS_FILE} 파일을 찾을 수 없습니다. "
-            "로컬 실행은 프로젝트 루트에 credentials.json을 두고, "
-            "Streamlit Cloud는 [google_sheets_oauth], "
-            "GitHub Actions는 GOOGLE_SHEETS_* Secrets를 사용하세요."
-        )
+        return None
 
     flow = InstalledAppFlow.from_client_secrets_file(
-        str(CREDENTIALS_FILE),
-        scopes=[SPREADSHEETS_WRITE_SCOPE],
+        CREDENTIALS_FILE,
+        [SPREADSHEETS_WRITE_SCOPE],
     )
-
     creds = flow.run_local_server(port=0)
-    TOKEN_FILE.write_text(
-        creds.to_json(),
-        encoding="utf-8",
-    )
+    TOKEN_FILE.write_text(creds.to_json(), encoding="utf-8")
     return creds
 
 
-def get_sheets_credentials() -> Credentials:
+def get_sheets_credentials():
     """
-    Google Sheets 쓰기 OAuth 우선순위
+    Authentication priority:
+      1. Local service_account_greating.json
+      2. GOOGLE_SERVICE_ACCOUNT_JSON environment variable
+      3. Streamlit [google_service_account]
+      4. Existing GOOGLE_SHEETS_* OAuth environment variables
+      5. Existing Streamlit [google_sheets_oauth]
+      6. Existing local token_sheets.json
+      7. Existing local credentials.json interactive OAuth
 
-    1. OS 환경변수
-       - GitHub Actions Secrets가 env로 주입됨
-    2. Streamlit Secrets [google_sheets_oauth]
-       - Streamlit Cloud의 수동 적재 버튼
-    3. 로컬 token_sheets.json
-       - Windows 로컬 수집
-    4. credentials.json OAuth 로그인
-       - 로컬 최초 인증
+    Existing OAuth routes remain as fallback during migration.
     """
-    for loader in (
-        _credentials_from_environment,
-        _credentials_from_streamlit,
-        _credentials_from_local_token,
-    ):
-        creds = loader()
+    loaders = [
+        _service_account_from_local_file,
+        _service_account_from_environment,
+        _service_account_from_streamlit,
+        _oauth_from_environment,
+        _oauth_from_streamlit,
+        _oauth_from_local_token,
+        _oauth_from_local_interactive,
+    ]
+
+    errors: list[str] = []
+
+    for loader in loaders:
+        try:
+            creds = loader()
+        except Exception as exc:
+            errors.append(f"{loader.__name__}: {type(exc).__name__}: {exc}")
+            continue
+
         if creds is not None:
             return creds
 
-    return _run_local_oauth()
+    detail = "\n".join(errors)
+    raise RuntimeError(
+        "Google Sheets credentials were not found."
+        + (f"\nErrors while trying auth methods:\n{detail}" if detail else "")
+    )
+
+
+def get_sheets_auth_source() -> str:
+    if SERVICE_ACCOUNT_FILE.exists():
+        return "service_account_local_file"
+
+    if os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip():
+        return "service_account_environment"
+
+    try:
+        import streamlit as st
+        if st.secrets.get("google_service_account"):
+            return "service_account_streamlit"
+    except Exception:
+        pass
+
+    if any(
+        os.environ.get(env_name, "").strip()
+        for env_name in OAUTH_ENV_MAP.values()
+    ):
+        return "oauth_environment"
+
+    try:
+        import streamlit as st
+        if st.secrets.get("google_sheets_oauth"):
+            return "oauth_streamlit"
+    except Exception:
+        pass
+
+    if TOKEN_FILE.exists():
+        return "oauth_local_token"
+
+    if CREDENTIALS_FILE.exists():
+        return "oauth_local_interactive"
+
+    return "none"

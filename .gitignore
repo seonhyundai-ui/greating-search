@@ -27,3 +27,5 @@ token*.json
 .DS_Store
 Thumbs.db
 logs/
+
+service_account*.json

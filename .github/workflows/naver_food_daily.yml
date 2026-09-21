@@ -1,35 +1,21 @@
-name: NAVER Food Daily Load
+name: NAVER Food Daily
 
 on:
   schedule:
-    # GitHub Actions cron uses UTC.
-    # 00:30 UTC = 09:30 KST.
+    # 09:30 KST = 00:30 UTC
     - cron: "30 0 * * *"
-
-  # GitHub > Actions에서 필요할 때 수동 실행 가능
   workflow_dispatch:
-
-concurrency:
-  group: naver-food-daily-load
-  cancel-in-progress: false
 
 jobs:
   collect:
-    name: Collect D-1 NAVER Food Trend
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
 
     env:
-      GOOGLE_SHEETS_REFRESH_TOKEN: ${{ secrets.GOOGLE_SHEETS_REFRESH_TOKEN }}
-      GOOGLE_SHEETS_TOKEN_URI: ${{ secrets.GOOGLE_SHEETS_TOKEN_URI }}
-      GOOGLE_SHEETS_CLIENT_ID: ${{ secrets.GOOGLE_SHEETS_CLIENT_ID }}
-      GOOGLE_SHEETS_CLIENT_SECRET: ${{ secrets.GOOGLE_SHEETS_CLIENT_SECRET }}
-
+      GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
       NAVER_SEARCH_2025_ID: ${{ secrets.NAVER_SEARCH_2025_ID }}
       NAVER_SEARCH_2026_ID: ${{ secrets.NAVER_SEARCH_2026_ID }}
       NAVER_SEARCH_2027_ID: ${{ secrets.NAVER_SEARCH_2027_ID }}
-
-      PYTHONUNBUFFERED: "1"
 
     steps:
       - name: Checkout repository
@@ -39,13 +25,11 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: "pip"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Collect NAVER D-1 data
-        run: |
-          python -m src.naver_food_to_sheets
+      - name: Run NAVER food daily collector
+        run: python -m src.naver_food_to_sheets
