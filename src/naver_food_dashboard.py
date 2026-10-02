@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pandas as pd
 import streamlit as st
-from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
+from src.google_sheets_auth import get_sheets_credentials
 
 from src.naver_monthly_store import (
     DATA_HEADERS,
@@ -18,66 +18,15 @@ from src.naver_monthly_store import (
 from src.naver_spreadsheet_config import get_spreadsheet_ids
 
 APP_VERSION = "0.4.0"
-LOCAL_TOKEN_FILE = Path("token_sheets.json")
-
-
-def _cloud_credentials() -> Credentials | None:
-    for section_name in (
-        "google_sheets_oauth",
-        "google_oauth",
-    ):
-        if section_name not in st.secrets:
-            continue
-
-        section = st.secrets[section_name]
-        required = (
-            "refresh_token",
-            "token_uri",
-            "client_id",
-            "client_secret",
-        )
-
-        if not all(
-            section.get(key)
-            for key in required
-        ):
-            continue
-
-        return Credentials(
-            token=None,
-            refresh_token=section["refresh_token"],
-            token_uri=section["token_uri"],
-            client_id=section["client_id"],
-            client_secret=section["client_secret"],
-        )
-
-    return None
-
-
-def get_sheets_read_credentials() -> Credentials:
-    cloud = _cloud_credentials()
-
-    if cloud is not None:
-        return cloud
-
-    if not LOCAL_TOKEN_FILE.exists():
-        raise FileNotFoundError(
-            "로컬 token_sheets.json을 찾을 수 없습니다."
-        )
-
-    return Credentials.from_authorized_user_file(
-        str(LOCAL_TOKEN_FILE)
-    )
 
 
 def _service():
     return build(
         "sheets",
         "v4",
-        credentials=get_sheets_read_credentials(),
+        credentials=get_sheets_credentials(),
         cache_discovery=False,
     )
-
 
 def _sheet_titles(
     service,
